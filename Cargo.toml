@@ -1,0 +1,27 @@
+[package]
+name = "tangle-inference-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared infrastructure for Tangle inference blueprints"
+
+[dependencies]
+alloy = { version = "1", features = ["provider-http", "signer-local", "contract", "sol-types"] }
+anyhow = "1"
+axum = "0.7"
+config = "0.14"
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa"] }
+prometheus = "0.13"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "limit", "timeout", "trace"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "minimal_operator"
+path = "examples/minimal_operator.rs"

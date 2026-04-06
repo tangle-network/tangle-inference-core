@@ -1,0 +1,624 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use alloy::primitives::Address;
+use axum::{
+    body::Body,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+use crate::billing::BillingClient;
+use crate::config::{BillingConfig, ServerConfig, TangleConfig};
+
+// x402 header constants
+pub const X402_PAYMENT_REQUIRED: &str = "X-Payment-Required";
+pub const X402_PAYMENT_TOKEN: &str = "X-Payment-Token";
+pub const X402_PAYMENT_RECIPIENT: &str = "X-Payment-Recipient";
+pub const X402_PAYMENT_NETWORK: &str = "X-Payment-Network";
+pub const X402_PAYMENT_SIGNATURE: &str = "X-Payment-Signature";
+
+/// Nonce key: (commitment, nonce) pair for replay protection.
+pub type NonceKey = (String, u64);
+
+#[derive(Serialize, Deserialize)]
+struct NonceRecord {
+    commitment: String,
+    nonce: u64,
+    expiry: u64,
+}
+
+/// Replay-protection nonce store with optional file persistence.
+///
+/// Uses `tokio::sync::RwLock` for async-first access patterns.
+/// Without persistence (`nonce_store_path` unset), operator restarts clear all
+/// nonces, allowing replay of any unexpired SpendAuth signatures.
+pub struct NonceStore {
+    nonces: RwLock<HashMap<NonceKey, u64>>,
+    path: Option<PathBuf>,
+}
+
+impl NonceStore {
+    /// Create a new nonce store, loading persisted nonces from disk if path is set.
+    pub fn load(path: Option<PathBuf>) -> Self {
+        let nonces: HashMap<NonceKey, u64> = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|data| serde_json::from_str::<Vec<NonceRecord>>(&data).ok())
+            .map(|records| {
+                records
+                    .into_iter()
+                    .map(|r| ((r.commitment, r.nonce), r.expiry))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if path.is_some() {
+            tracing::info!(count = nonces.len(), "loaded persisted nonces");
+        } else {
+            tracing::warn!(
+                "nonce_store_path not configured — nonces are in-memory only. \
+                 Operator restart will allow replay of unexpired SpendAuth signatures."
+            );
+        }
+
+        Self {
+            nonces: RwLock::new(nonces),
+            path,
+        }
+    }
+
+    /// Evict expired nonces and check if the key is already used.
+    /// Returns true if replay detected (nonce already seen).
+    pub async fn check_replay(&self, key: &NonceKey, tolerance: u64) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut nonces = self.nonces.write().await;
+        nonces.retain(|_, expiry| now <= expiry.saturating_add(tolerance));
+        nonces.contains_key(key)
+    }
+
+    /// Record a nonce as used, evict expired entries, and persist to disk.
+    pub async fn insert(&self, key: NonceKey, expiry: u64, tolerance: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut nonces = self.nonces.write().await;
+        nonces.retain(|_, exp| now <= exp.saturating_add(tolerance));
+        nonces.insert(key, expiry);
+        self.persist(&nonces);
+    }
+
+    fn persist(&self, nonces: &HashMap<NonceKey, u64>) {
+        let Some(ref path) = self.path else { return };
+        let records: Vec<NonceRecord> = nonces
+            .iter()
+            .map(|((commitment, nonce), expiry)| NonceRecord {
+                commitment: commitment.clone(),
+                nonce: *nonce,
+                expiry: *expiry,
+            })
+            .collect();
+        let Ok(data) = serde_json::to_string(&records) else {
+            tracing::error!("failed to serialize nonce store");
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &data).is_ok() {
+            if let Err(e) = std::fs::rename(&tmp, path) {
+                tracing::warn!(error = %e, "failed to persist nonce store");
+            }
+        }
+    }
+}
+
+/// RAII guard that decrements the per-account active request count on drop.
+pub struct AccountGuard {
+    commitment: String,
+    active: Arc<RwLock<HashMap<String, usize>>>,
+}
+
+impl AccountGuard {
+    pub fn new(commitment: String, active: Arc<RwLock<HashMap<String, usize>>>) -> Self {
+        Self { commitment, active }
+    }
+}
+
+impl Drop for AccountGuard {
+    fn drop(&mut self) {
+        // Use try_write to avoid blocking in drop; if contended, spawn a task.
+        match self.active.try_write() {
+            Ok(mut map) => {
+                if let Some(count) = map.get_mut(&self.commitment) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        map.remove(&self.commitment);
+                    }
+                }
+            }
+            Err(_) => {
+                let commitment = self.commitment.clone();
+                let active = Arc::clone(&self.active);
+                tokio::spawn(async move {
+                    let mut map = active.write().await;
+                    if let Some(count) = map.get_mut(&commitment) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            map.remove(&commitment);
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Shared application state.
+///
+/// Backend-specific state (vLLM process, Modal client, etc.) is attached as
+/// an opaque `Arc<dyn Any + Send + Sync>` and retrieved via [`AppState::backend`].
+/// Construct via [`AppStateBuilder`].
+#[derive(Clone)]
+pub struct AppState {
+    pub billing: Arc<BillingClient>,
+    pub nonce_store: Arc<NonceStore>,
+    pub server_config: Arc<ServerConfig>,
+    pub billing_config: Arc<BillingConfig>,
+    pub tangle_config: Arc<TangleConfig>,
+    pub operator_address: Address,
+    pub semaphore: Arc<tokio::sync::Semaphore>,
+    pub active_per_account: Arc<RwLock<HashMap<String, usize>>>,
+    /// Backend-specific state. Downcast via [`AppState::backend`].
+    pub backend: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl AppState {
+    /// Downcast the backend extension to a concrete type.
+    ///
+    /// Returns `None` if the stored backend is not of type `B`.
+    pub fn backend<B: 'static>(&self) -> Option<&B> {
+        self.backend.downcast_ref::<B>()
+    }
+}
+
+/// Builder for [`AppState`]. Required fields: `billing`, `nonce_store`,
+/// `server_config`, `billing_config`, `tangle_config`, `operator_address`,
+/// `backend`. `max_concurrent` defaults to `server_config.max_concurrent_requests`.
+#[derive(Default)]
+pub struct AppStateBuilder {
+    billing: Option<Arc<BillingClient>>,
+    nonce_store: Option<Arc<NonceStore>>,
+    server_config: Option<Arc<ServerConfig>>,
+    billing_config: Option<Arc<BillingConfig>>,
+    tangle_config: Option<Arc<TangleConfig>>,
+    operator_address: Option<Address>,
+    max_concurrent: Option<usize>,
+    backend: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl AppStateBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn billing(mut self, b: Arc<BillingClient>) -> Self {
+        self.billing = Some(b);
+        self
+    }
+
+    pub fn nonce_store(mut self, n: Arc<NonceStore>) -> Self {
+        self.nonce_store = Some(n);
+        self
+    }
+
+    pub fn server_config(mut self, c: Arc<ServerConfig>) -> Self {
+        self.server_config = Some(c);
+        self
+    }
+
+    pub fn billing_config(mut self, c: Arc<BillingConfig>) -> Self {
+        self.billing_config = Some(c);
+        self
+    }
+
+    pub fn tangle_config(mut self, c: Arc<TangleConfig>) -> Self {
+        self.tangle_config = Some(c);
+        self
+    }
+
+    pub fn operator_address(mut self, a: Address) -> Self {
+        self.operator_address = Some(a);
+        self
+    }
+
+    pub fn max_concurrent(mut self, n: usize) -> Self {
+        self.max_concurrent = Some(n);
+        self
+    }
+
+    /// Attach a backend value of any type. Retrieve in handlers via
+    /// `state.backend::<MyBackend>().unwrap()`.
+    pub fn backend<B: Send + Sync + 'static>(mut self, b: B) -> Self {
+        self.backend = Some(Arc::new(b));
+        self
+    }
+
+    pub fn build(self) -> anyhow::Result<AppState> {
+        let billing = self
+            .billing
+            .ok_or_else(|| anyhow::anyhow!("AppStateBuilder: billing is required"))?;
+        let nonce_store = self
+            .nonce_store
+            .ok_or_else(|| anyhow::anyhow!("AppStateBuilder: nonce_store is required"))?;
+        let server_config = self
+            .server_config
+            .ok_or_else(|| anyhow::anyhow!("AppStateBuilder: server_config is required"))?;
+        let billing_config = self
+            .billing_config
+            .ok_or_else(|| anyhow::anyhow!("AppStateBuilder: billing_config is required"))?;
+        let tangle_config = self
+            .tangle_config
+            .ok_or_else(|| anyhow::anyhow!("AppStateBuilder: tangle_config is required"))?;
+        let operator_address = self
+            .operator_address
+            .ok_or_else(|| anyhow::anyhow!("AppStateBuilder: operator_address is required"))?;
+        let backend = self
+            .backend
+            .ok_or_else(|| anyhow::anyhow!("AppStateBuilder: backend is required"))?;
+
+        let max_concurrent = self
+            .max_concurrent
+            .unwrap_or(server_config.max_concurrent_requests);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+
+        Ok(AppState {
+            billing,
+            nonce_store,
+            server_config,
+            billing_config,
+            tangle_config,
+            operator_address,
+            semaphore,
+            active_per_account: Arc::new(RwLock::new(HashMap::new())),
+            backend,
+        })
+    }
+}
+
+/// Deserialize a u64 that may be JSON number or string.
+/// JS bigints serialize as JSON strings; this lets the Rust operator accept
+/// both the number form (from Rust/Go clients) and the string form (from the
+/// @tangle-network/tcloud SDK which emits `nonce: "0"`, `serviceId: "1"`, etc).
+fn de_u64_flex<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    use serde::Deserialize as _;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum N { Num(u64), Str(String) }
+    match N::deserialize(deserializer)? {
+        N::Num(n) => Ok(n),
+        N::Str(s) => s.parse::<u64>().map_err(serde::de::Error::custom),
+    }
+}
+
+fn de_u8_flex<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
+    use serde::Deserialize as _;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum N { Num(u8), Str(String) }
+    match N::deserialize(deserializer)? {
+        N::Num(n) => Ok(n),
+        N::Str(s) => s.parse::<u8>().map_err(serde::de::Error::custom),
+    }
+}
+
+/// ShieldedCredits spend authorization payload.
+///
+/// Accepts both camelCase (from JS SDK) and snake_case field names via
+/// `rename_all`. Numeric fields accept JSON number OR string form — the JS
+/// SDK serializes bigints as strings for JSON safety.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SpendAuthPayload {
+    pub commitment: String,
+    #[serde(deserialize_with = "de_u64_flex")]
+    pub service_id: u64,
+    #[serde(deserialize_with = "de_u8_flex")]
+    pub job_index: u8,
+    pub amount: String,
+    pub operator: String,
+    #[serde(deserialize_with = "de_u64_flex")]
+    pub nonce: u64,
+    #[serde(deserialize_with = "de_u64_flex")]
+    pub expiry: u64,
+    pub signature: String,
+}
+
+/// Standard error response body (OpenAI-compatible).
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error: ErrorDetail,
+}
+
+/// Error detail within an ErrorResponse.
+#[derive(Debug, Serialize)]
+pub struct ErrorDetail {
+    pub message: String,
+    pub r#type: String,
+    pub code: String,
+}
+
+/// Build a standard JSON error response.
+pub fn error_response(status: StatusCode, message: String, error_type: &str, code: &str) -> Response {
+    let body = ErrorResponse {
+        error: ErrorDetail {
+            message,
+            r#type: error_type.to_string(),
+            code: code.to_string(),
+        },
+    };
+    (status, Json(body)).into_response()
+}
+
+/// Build a 402 Payment Required response with x402 headers.
+pub fn payment_required(
+    billing_config: &BillingConfig,
+    tangle_config: &TangleConfig,
+    operator_address: Address,
+    estimated_amount: u64,
+) -> Response {
+    let amount = estimated_amount.max(billing_config.min_charge_amount);
+
+    let body = serde_json::json!({
+        "error": "payment_required",
+        "amount": amount.to_string(),
+        "token": billing_config.payment_token_address.as_deref()
+            .unwrap_or("0x0000000000000000000000000000000000000000"),
+        "recipient": format!("{}", operator_address),
+        "network": tangle_config.chain_id.to_string(),
+        "accepts": ["spend_auth"],
+        "description": "ShieldedCredits SpendAuth required. Include spend_auth in request body or X-Payment-Signature header."
+    });
+
+    Response::builder()
+        .status(StatusCode::PAYMENT_REQUIRED)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(X402_PAYMENT_REQUIRED, amount.to_string())
+        .header(
+            X402_PAYMENT_TOKEN,
+            billing_config
+                .payment_token_address
+                .as_deref()
+                .unwrap_or("0x0000000000000000000000000000000000000000"),
+        )
+        .header(X402_PAYMENT_RECIPIENT, format!("{}", operator_address))
+        .header(X402_PAYMENT_NETWORK, tangle_config.chain_id.to_string())
+        .body(Body::from(serde_json::to_string(&body).unwrap_or_default()))
+        .unwrap_or_else(|e| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to build 402 response: {e}"),
+                "internal_error",
+                "response_build_failed",
+            )
+        })
+}
+
+/// Try to extract a SpendAuth from x402 headers (X-Payment-Signature).
+/// The header value is JSON or hex-encoded JSON.
+pub fn extract_x402_spend_auth(headers: &HeaderMap) -> Option<SpendAuthPayload> {
+    let header_val = headers.get(X402_PAYMENT_SIGNATURE)?.to_str().ok()?;
+
+    // Try direct JSON first
+    if let Ok(payload) = serde_json::from_str::<SpendAuthPayload>(header_val) {
+        return Some(payload);
+    }
+
+    // Try hex-encoded JSON
+    let hex_str = header_val.strip_prefix("0x").unwrap_or(header_val);
+    if let Ok(decoded) = hex::decode(hex_str) {
+        if let Ok(payload) = serde_json::from_slice::<SpendAuthPayload>(&decoded) {
+            return Some(payload);
+        }
+    }
+
+    None
+}
+
+/// Validate a SpendAuth payload against operator configuration.
+///
+/// Checks: amount parsing, min charge, max spend, operator address match,
+/// service ID match, nonce replay. Returns an error response on any failure,
+/// or Ok(parsed_amount) on success.
+pub async fn validate_spend_auth(
+    state: &AppState,
+    spend_auth: &SpendAuthPayload,
+) -> Result<u64, Response> {
+    // Parse amount
+    let requested_amount: u64 = spend_auth.amount.parse().map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid spend_auth amount: must be a valid u64 integer".to_string(),
+            "billing_error",
+            "invalid_amount",
+        )
+    })?;
+
+    // Min charge
+    let min_charge = state.billing_config.min_charge_amount;
+    if min_charge > 0 && requested_amount < min_charge {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("spend authorization amount ({requested_amount}) is below minimum charge ({min_charge})"),
+            "billing_error",
+            "below_min_charge",
+        ));
+    }
+
+    // Max spend
+    let max_spend = state.billing_config.max_spend_per_request;
+    if max_spend > 0 && requested_amount > max_spend {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("spend authorization amount ({requested_amount}) exceeds max_spend_per_request ({max_spend})"),
+            "billing_error",
+            "exceeds_max_spend",
+        ));
+    }
+
+    // Operator address match
+    let spend_operator: Address = spend_auth.operator.parse().map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid operator address in spend_auth".to_string(),
+            "billing_error",
+            "invalid_operator",
+        )
+    })?;
+    if spend_operator != state.operator_address {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "spend_auth operator ({spend_operator}) does not match this operator ({})",
+                state.operator_address
+            ),
+            "billing_error",
+            "operator_mismatch",
+        ));
+    }
+
+    // Service ID match
+    if let Some(expected_service_id) = state.tangle_config.service_id {
+        if spend_auth.service_id != expected_service_id {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "spend_auth service_id ({}) does not match operator service ({expected_service_id})",
+                    spend_auth.service_id
+                ),
+                "billing_error",
+                "service_id_mismatch",
+            ));
+        }
+    }
+
+    // Nonce replay check + record
+    let nonce_key = (spend_auth.commitment.clone(), spend_auth.nonce);
+    if state
+        .nonce_store
+        .check_replay(&nonce_key, state.billing_config.clock_skew_tolerance_secs)
+        .await
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "spend_auth nonce already used (replay detected)".to_string(),
+            "billing_error",
+            "nonce_replay",
+        ));
+    }
+    // Record nonce as used BEFORE serving — prevents double-spend if a
+    // concurrent request arrives with the same nonce while we're still
+    // processing. If downstream validation fails we've "wasted" a nonce,
+    // which is safe (the client can always generate a new one).
+    state
+        .nonce_store
+        .insert(
+            nonce_key,
+            spend_auth.expiry,
+            state.billing_config.clock_skew_tolerance_secs,
+        )
+        .await;
+
+    // Recover signer
+    let recovered_address = crate::billing::recover_spend_auth_signer(
+        spend_auth,
+        &state.tangle_config.shielded_credits,
+        state.tangle_config.chain_id,
+        state.billing_config.clock_skew_tolerance_secs,
+    )
+    .map_err(|reason| {
+        error_response(
+            StatusCode::PAYMENT_REQUIRED,
+            format!("invalid SpendAuth signature: {reason}"),
+            "billing_error",
+            "invalid_spend_auth",
+        )
+    })?;
+
+    // Verify on-chain spending key
+    match state.billing.get_account_info(&spend_auth.commitment).await {
+        Ok(account_info) => {
+            if recovered_address != account_info.spending_key {
+                return Err(error_response(
+                    StatusCode::PAYMENT_REQUIRED,
+                    "SpendAuth signer does not match account spending key".to_string(),
+                    "billing_error",
+                    "signer_mismatch",
+                ));
+            }
+
+            let min_balance = state.billing_config.min_credit_balance;
+            if min_balance > 0
+                && account_info.balance < alloy::primitives::U256::from(min_balance)
+            {
+                return Err(error_response(
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!(
+                        "credit balance ({}) is below minimum required ({min_balance})",
+                        account_info.balance
+                    ),
+                    "billing_error",
+                    "insufficient_balance",
+                ));
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to check account info");
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to verify account info".to_string(),
+                "billing_error",
+                "account_check_failed",
+            ));
+        }
+    }
+
+    Ok(requested_amount)
+}
+
+/// Settle billing after successful inference. Calculates the actual cost,
+/// caps at pre-authorized amount, and claims payment on-chain.
+pub async fn settle_billing(
+    billing: &BillingClient,
+    spend_auth: &SpendAuthPayload,
+    preauth_amount: u64,
+    actual_cost: u64,
+) {
+    let charge_amount = actual_cost.min(preauth_amount);
+
+    tracing::info!(
+        actual_cost,
+        preauth_amount,
+        charge_amount,
+        "settling billing (contract settles full pre-auth)"
+    );
+
+    if charge_amount > 0 {
+        if let Err(e) = billing.claim_payment(spend_auth, charge_amount).await {
+            tracing::error!(
+                error = %e,
+                charge_amount,
+                "billing settlement failed — revenue lost"
+            );
+        }
+    }
+}
