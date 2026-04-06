@@ -618,3 +618,64 @@ async fn error_response_returns_correct_status_and_json() {
     assert_eq!(json["error"]["type"], "rate_limit");
     assert_eq!(json["error"]["code"], "too_many_requests");
 }
+
+#[tokio::test]
+async fn check_and_insert_is_atomic_under_contention() {
+    let store = Arc::new(NonceStore::load(None));
+    let key = ("commitment-race".to_string(), 42u64);
+    let expiry = 9999999999u64;
+    let tolerance = 300u64;
+
+    let mut handles = Vec::new();
+    for _ in 0..100 {
+        let store = store.clone();
+        let key = key.clone();
+        handles.push(tokio::spawn(async move {
+            store.check_and_insert(key, expiry, tolerance).await
+        }));
+    }
+
+    let results: Vec<bool> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    let fresh_count = results.iter().filter(|&&was_replay| !was_replay).count();
+    let replay_count = results.iter().filter(|&&was_replay| was_replay).count();
+
+    assert_eq!(fresh_count, 1, "exactly one task should see a fresh nonce");
+    assert_eq!(replay_count, 99, "all others should see replay");
+}
+
+#[tokio::test]
+async fn app_state_from_config_constructs_correctly() {
+    let tangle = test_tangle_config();
+    let server = ServerConfig {
+        host: "127.0.0.1".into(),
+        port: 8080,
+        max_concurrent_requests: 8,
+        max_request_body_bytes: 1024 * 1024,
+        stream_timeout_secs: 60,
+        idle_chunk_timeout_secs: 10,
+        max_line_buf_bytes: 64 * 1024,
+        max_per_account_requests: 0,
+    };
+    let billing = test_billing_config();
+
+    let state = AppState::from_config(
+        &tangle,
+        &server,
+        &billing,
+        4,
+        MockBackend {
+            name: "from-config".into(),
+            model: "test".into(),
+        },
+    )
+    .expect("from_config should succeed");
+
+    let backend = state.backend::<MockBackend>().expect("downcast");
+    assert_eq!(backend.name, "from-config");
+    assert_eq!(state.semaphore.available_permits(), 4);
+}

@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 
 use crate::billing::BillingClient;
 use crate::config::{BillingConfig, ServerConfig, TangleConfig};
+use crate::settlement_queue::{FailedSettlement, SettlementRecoveryQueue};
 
 // x402 header constants
 pub const X402_PAYMENT_REQUIRED: &str = "X-Payment-Required";
@@ -226,6 +227,8 @@ pub struct AppState {
     pub operator_address: Address,
     pub semaphore: Arc<tokio::sync::Semaphore>,
     pub active_per_account: Arc<RwLock<HashMap<String, usize>>>,
+    /// Persistent dead-letter queue for failed on-chain settlements.
+    pub settlement_recovery_queue: Option<Arc<SettlementRecoveryQueue>>,
     /// Backend-specific state. Downcast via [`AppState::backend`].
     pub backend: Arc<dyn std::any::Any + Send + Sync>,
 }
@@ -236,6 +239,32 @@ impl AppState {
     /// Returns `None` if the stored backend is not of type `B`.
     pub fn backend<B: 'static>(&self) -> Option<&B> {
         self.backend.downcast_ref::<B>()
+    }
+
+    /// Convenience constructor that wires up BillingClient, NonceStore, and
+    /// operator address from config structs. Blueprints only need to provide
+    /// their backend and max_concurrent setting.
+    pub fn from_config<B: Send + Sync + 'static>(
+        tangle: &TangleConfig,
+        server: &ServerConfig,
+        billing: &BillingConfig,
+        max_concurrent: usize,
+        backend: B,
+    ) -> anyhow::Result<Self> {
+        let billing_client = BillingClient::new(tangle, billing)?;
+        let operator_address = billing_client.operator_address();
+        let nonce_store = Arc::new(NonceStore::load(billing.nonce_store_path.clone()));
+
+        AppStateBuilder::new()
+            .billing(Arc::new(billing_client))
+            .nonce_store(nonce_store)
+            .server_config(Arc::new(server.clone()))
+            .billing_config(Arc::new(billing.clone()))
+            .tangle_config(Arc::new(tangle.clone()))
+            .operator_address(operator_address)
+            .max_concurrent(max_concurrent)
+            .backend(backend)
+            .build()
     }
 }
 
@@ -251,6 +280,7 @@ pub struct AppStateBuilder {
     tangle_config: Option<Arc<TangleConfig>>,
     operator_address: Option<Address>,
     max_concurrent: Option<usize>,
+    settlement_recovery_queue: Option<Arc<SettlementRecoveryQueue>>,
     backend: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
@@ -291,6 +321,11 @@ impl AppStateBuilder {
 
     pub fn max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = Some(n);
+        self
+    }
+
+    pub fn settlement_recovery_queue(mut self, q: Arc<SettlementRecoveryQueue>) -> Self {
+        self.settlement_recovery_queue = Some(q);
         self
     }
 
@@ -338,6 +373,7 @@ impl AppStateBuilder {
             operator_address,
             semaphore,
             active_per_account: Arc::new(RwLock::new(HashMap::new())),
+            settlement_recovery_queue: self.settlement_recovery_queue,
             backend,
         })
     }
@@ -639,8 +675,96 @@ pub async fn validate_spend_auth(
     Ok(requested_amount)
 }
 
+/// Prometheus metrics endpoint handler. Returns metrics in text format.
+pub async fn metrics_handler() -> Response {
+    let body = crate::metrics::gather();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(Body::from(body))
+        .unwrap_or_else(|e| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to build metrics response: {e}"),
+                "internal_error",
+                "response_build_failed",
+            )
+        })
+}
+
+/// GPU health endpoint handler. Returns detected GPU info.
+pub async fn gpu_health_handler(
+) -> Result<Json<Vec<crate::health::GpuInfo>>, (StatusCode, String)> {
+    match crate::health::detect_gpus().await {
+        Ok(gpus) => Ok(Json(gpus)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+/// Try to acquire a semaphore permit from AppState. Returns 429 on failure.
+#[allow(clippy::result_large_err)]
+pub fn acquire_permit(
+    state: &AppState,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
+    state.semaphore.clone().try_acquire_owned().map_err(|_| {
+        error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "server at capacity".to_string(),
+            "rate_limit_error",
+            "too_many_requests",
+        )
+    })
+}
+
+/// Full billing gate: extract SpendAuth from body or x402 header, enforce
+/// `billing_required`, validate signature/nonce/balance, and pre-authorize
+/// the spend on-chain. Returns `(spend_auth, preauth_amount)` on success.
+///
+/// Callers settle after serving via [`settle_billing`].
+pub async fn billing_gate(
+    state: &AppState,
+    headers: &HeaderMap,
+    body_spend_auth: Option<SpendAuthPayload>,
+    estimated_cost: u64,
+) -> Result<(Option<SpendAuthPayload>, Option<u64>), Response> {
+    let spend_auth = body_spend_auth.or_else(|| extract_x402_spend_auth(headers));
+
+    if state.billing_config.billing_required && spend_auth.is_none() {
+        return Err(payment_required(
+            &state.billing_config,
+            &state.tangle_config,
+            state.operator_address,
+            estimated_cost.max(state.billing_config.min_charge_amount),
+        ));
+    }
+
+    let Some(spend_auth) = spend_auth else {
+        return Ok((None, None));
+    };
+
+    let preauth_amount = validate_spend_auth(state, &spend_auth).await?;
+
+    if let Err(e) = state.billing.authorize_spend(&spend_auth).await {
+        tracing::error!(error = %e, "authorizeSpend failed");
+        return Err(error_response(
+            StatusCode::PAYMENT_REQUIRED,
+            format!("billing authorization failed: {e}"),
+            "billing_error",
+            "authorization_failed",
+        ));
+    }
+
+    Ok((Some(spend_auth), Some(preauth_amount)))
+}
+
 /// Settle billing after successful inference. Calculates the actual cost,
 /// caps at pre-authorized amount, and claims payment on-chain.
+///
+/// If `claim_payment` fails after all retries and a recovery queue is
+/// provided, the failed settlement is persisted for later retry.
 ///
 /// Returns an error if `claim_payment` fails after all retries so callers
 /// can log / alert appropriately.
@@ -649,6 +773,18 @@ pub async fn settle_billing(
     spend_auth: &SpendAuthPayload,
     preauth_amount: u64,
     actual_cost: u64,
+) -> Result<(), anyhow::Error> {
+    settle_billing_with_recovery(billing, spend_auth, preauth_amount, actual_cost, None).await
+}
+
+/// Like [`settle_billing`] but accepts an optional dead-letter queue for
+/// failed settlements.
+pub async fn settle_billing_with_recovery(
+    billing: &BillingClient,
+    spend_auth: &SpendAuthPayload,
+    preauth_amount: u64,
+    actual_cost: u64,
+    recovery_queue: Option<&SettlementRecoveryQueue>,
 ) -> Result<(), anyhow::Error> {
     let charge_amount = actual_cost.min(preauth_amount);
 
@@ -660,7 +796,29 @@ pub async fn settle_billing(
     );
 
     if charge_amount > 0 {
-        billing.claim_payment(spend_auth, charge_amount).await?;
+        if let Err(e) = billing.claim_payment(spend_auth, charge_amount).await {
+            if let Some(queue) = recovery_queue {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                queue.enqueue(FailedSettlement {
+                    commitment: spend_auth.commitment.clone(),
+                    nonce: spend_auth.nonce,
+                    amount: charge_amount.to_string(),
+                    operator: spend_auth.operator.clone(),
+                    service_id: spend_auth.service_id,
+                    timestamp: now,
+                    error: format!("{e}"),
+                    retry_count: 0,
+                });
+                tracing::error!(
+                    error = %e,
+                    "claimPayment failed — enqueued to dead-letter queue for retry"
+                );
+            }
+            return Err(e);
+        }
     }
 
     Ok(())
