@@ -16,11 +16,18 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature};
 
+use axum::http::{HeaderMap, StatusCode};
+
 use tangle_inference_core::billing::{recover_spend_auth_signer, verify_spend_auth_signature};
+use tangle_inference_core::server::{
+    error_response, extract_x402_spend_auth, payment_required, validate_spend_auth,
+    X402_PAYMENT_NETWORK, X402_PAYMENT_RECIPIENT, X402_PAYMENT_REQUIRED, X402_PAYMENT_SIGNATURE,
+    X402_PAYMENT_TOKEN,
+};
 use tangle_inference_core::{
-    AppStateBuilder, BillingClient, BillingConfig, CostModel, CostParams, FlatRequestCostModel,
-    NonceStore, PerCharCostModel, PerImageCostModel, PerSecondCostModel, PerTokenCostModel,
-    ServerConfig, SpendAuthPayload, TangleConfig, TaskTypeCostModel,
+    AppState, AppStateBuilder, BillingClient, BillingConfig, CostModel, CostParams,
+    FlatRequestCostModel, NonceStore, PerCharCostModel, PerImageCostModel, PerSecondCostModel,
+    PerTokenCostModel, ServerConfig, SpendAuthPayload, TangleConfig, TaskTypeCostModel,
 };
 
 /// Mock backend a blueprint would plug in. Any `Send + Sync + 'static` type works.
@@ -382,4 +389,232 @@ async fn nonce_store_persists_across_reload() {
     // Reload from disk.
     let reloaded = NonceStore::load(Some(path));
     assert!(reloaded.check_replay(&key, 30).await);
+}
+
+// --- Helpers for validate_spend_auth / payment_required / extract_x402 tests ---
+
+fn build_test_state() -> AppState {
+    let billing = BillingClient::new(&test_tangle_config(), &test_billing_config())
+        .expect("billing client");
+    let operator = billing.operator_address();
+    let tmp = tempfile::tempdir().unwrap();
+    let nonce_path = tmp.path().join("nonces.json");
+
+    // Leak the tempdir so it lives long enough for the test.
+    std::mem::forget(tmp);
+
+    AppStateBuilder::new()
+        .billing(Arc::new(billing))
+        .nonce_store(Arc::new(NonceStore::load(Some(nonce_path))))
+        .server_config(Arc::new(ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            max_concurrent_requests: 8,
+            max_request_body_bytes: 1024 * 1024,
+            stream_timeout_secs: 60,
+            idle_chunk_timeout_secs: 10,
+            max_line_buf_bytes: 64 * 1024,
+            max_per_account_requests: 0,
+        }))
+        .billing_config(Arc::new(test_billing_config()))
+        .tangle_config(Arc::new(test_tangle_config()))
+        .operator_address(operator)
+        .max_concurrent(4)
+        .backend(MockBackend {
+            name: "test".into(),
+            model: "test".into(),
+        })
+        .build()
+        .expect("build state")
+}
+
+fn make_spend_auth(operator: Address, amount: u64, nonce: u64) -> SpendAuthPayload {
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+
+    SpendAuthPayload {
+        commitment: "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
+        service_id: 42,
+        job_index: 0,
+        amount: amount.to_string(),
+        operator: format!("{operator:#x}"),
+        nonce,
+        expiry,
+        signature: "0x".to_string() + &"00".repeat(65), // dummy sig
+    }
+}
+
+fn response_status(resp: &axum::response::Response) -> StatusCode {
+    resp.status()
+}
+
+// --- validate_spend_auth tests ---
+
+#[tokio::test]
+async fn validate_spend_auth_rejects_amount_below_min_charge() {
+    let state = build_test_state();
+    // min_charge_amount is 100, so 50 should fail.
+    let auth = make_spend_auth(state.operator_address, 50, 100);
+    let result = validate_spend_auth(&state, &auth).await;
+    assert!(result.is_err());
+    let resp = result.unwrap_err();
+    assert_eq!(response_status(&resp), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn validate_spend_auth_rejects_amount_above_max_spend() {
+    let state = build_test_state();
+    // max_spend_per_request is 1_000_000, so 2_000_000 should fail.
+    let auth = make_spend_auth(state.operator_address, 2_000_000, 101);
+    let result = validate_spend_auth(&state, &auth).await;
+    assert!(result.is_err());
+    let resp = result.unwrap_err();
+    assert_eq!(response_status(&resp), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn validate_spend_auth_rejects_wrong_operator() {
+    let state = build_test_state();
+    let wrong_operator: Address = "0x000000000000000000000000000000000000dEaD"
+        .parse()
+        .unwrap();
+    let auth = make_spend_auth(wrong_operator, 500, 102);
+    let result = validate_spend_auth(&state, &auth).await;
+    assert!(result.is_err());
+    let resp = result.unwrap_err();
+    assert_eq!(response_status(&resp), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn validate_spend_auth_rejects_expired_nonce() {
+    let state = build_test_state();
+    let mut auth = make_spend_auth(state.operator_address, 500, 103);
+    // Set expiry in the past (well beyond clock_skew_tolerance of 30s).
+    auth.expiry = 1;
+    let result = validate_spend_auth(&state, &auth).await;
+    // The nonce check itself won't reject an expired nonce (it's evicted),
+    // but the signature recovery step will reject it due to expiry check.
+    // Either way, should be Err.
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn validate_spend_auth_rejects_nonce_replay() {
+    let state = build_test_state();
+    let auth = make_spend_auth(state.operator_address, 500, 200);
+
+    // First call — passes amount/operator/nonce checks, fails later at
+    // signature recovery (no real sig). That's fine: the nonce is now consumed.
+    let _ = validate_spend_auth(&state, &auth).await;
+
+    // Second call with same nonce — should be rejected as replay BEFORE
+    // hitting signature recovery. This tests the TOCTOU fix.
+    let result = validate_spend_auth(&state, &auth).await;
+    assert!(result.is_err());
+    let resp = result.unwrap_err();
+    assert_eq!(response_status(&resp), StatusCode::BAD_REQUEST);
+}
+
+// --- payment_required tests ---
+
+#[tokio::test]
+async fn payment_required_returns_402_with_x402_headers() {
+    let billing_cfg = test_billing_config();
+    let tangle_cfg = test_tangle_config();
+    let operator: Address = "0x000000000000000000000000000000000000dEaD"
+        .parse()
+        .unwrap();
+
+    let resp = payment_required(&billing_cfg, &tangle_cfg, operator, 5000);
+
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let headers = resp.headers();
+    assert!(headers.contains_key(X402_PAYMENT_REQUIRED));
+    assert!(headers.contains_key(X402_PAYMENT_TOKEN));
+    assert!(headers.contains_key(X402_PAYMENT_RECIPIENT));
+    assert!(headers.contains_key(X402_PAYMENT_NETWORK));
+
+    // Amount should be max(estimated, min_charge).
+    let amount_header = headers[X402_PAYMENT_REQUIRED].to_str().unwrap();
+    let amount: u64 = amount_header.parse().unwrap();
+    assert!(amount >= billing_cfg.min_charge_amount);
+    assert_eq!(amount, 5000); // 5000 > min_charge(100)
+}
+
+#[tokio::test]
+async fn payment_required_enforces_min_charge() {
+    let billing_cfg = test_billing_config();
+    let tangle_cfg = test_tangle_config();
+    let operator: Address = "0x000000000000000000000000000000000000dEaD"
+        .parse()
+        .unwrap();
+
+    // Request amount below min_charge — should be bumped.
+    let resp = payment_required(&billing_cfg, &tangle_cfg, operator, 10);
+    let amount_header = resp.headers()[X402_PAYMENT_REQUIRED].to_str().unwrap();
+    let amount: u64 = amount_header.parse().unwrap();
+    assert_eq!(amount, billing_cfg.min_charge_amount);
+}
+
+// --- extract_x402_spend_auth tests ---
+
+#[test]
+fn extract_x402_spend_auth_parses_valid_json_header() {
+    let payload = SpendAuthPayload {
+        commitment: "0xabc".into(),
+        service_id: 1,
+        job_index: 0,
+        amount: "1000".into(),
+        operator: "0x000000000000000000000000000000000000dEaD".into(),
+        nonce: 42,
+        expiry: 9999999999,
+        signature: "0xdeadbeef".into(),
+    };
+    let json = serde_json::to_string(&payload).unwrap();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(X402_PAYMENT_SIGNATURE, json.parse().unwrap());
+
+    let result = extract_x402_spend_auth(&headers);
+    assert!(result.is_some());
+    let parsed = result.unwrap();
+    assert_eq!(parsed.nonce, 42);
+    assert_eq!(parsed.commitment, "0xabc");
+}
+
+#[test]
+fn extract_x402_spend_auth_returns_none_for_missing_header() {
+    let headers = HeaderMap::new();
+    assert!(extract_x402_spend_auth(&headers).is_none());
+}
+
+#[test]
+fn extract_x402_spend_auth_returns_none_for_invalid_header() {
+    let mut headers = HeaderMap::new();
+    headers.insert(X402_PAYMENT_SIGNATURE, "not-json".parse().unwrap());
+    assert!(extract_x402_spend_auth(&headers).is_none());
+}
+
+// --- error_response tests ---
+
+#[tokio::test]
+async fn error_response_returns_correct_status_and_json() {
+    let resp = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate limited".into(),
+        "rate_limit",
+        "too_many_requests",
+    );
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["message"], "rate limited");
+    assert_eq!(json["error"]["type"], "rate_limit");
+    assert_eq!(json["error"]["code"], "too_many_requests");
 }

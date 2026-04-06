@@ -256,9 +256,8 @@ impl RequestGuard {
 
         ACTIVE_REQUESTS.inc();
         let current = ACTIVE_REQUESTS.get() as u64;
-        let peak = PEAK_CONCURRENT.load(Ordering::Relaxed);
-        if current > peak {
-            PEAK_CONCURRENT.store(current, Ordering::Relaxed);
+        let prev = PEAK_CONCURRENT.fetch_max(current, Ordering::Relaxed);
+        if current > prev {
             MAX_CONCURRENT_REQUESTS.set(current as f64);
         }
 
@@ -330,10 +329,7 @@ impl Drop for RequestGuard {
         LATENCY_SUM_MS.fetch_add(elapsed_ms, Ordering::Relaxed);
         LATENCY_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        let prev_max = LATENCY_MAX_MS.load(Ordering::Relaxed);
-        if elapsed_ms > prev_max {
-            LATENCY_MAX_MS.store(elapsed_ms, Ordering::Relaxed);
-        }
+        LATENCY_MAX_MS.fetch_max(elapsed_ms, Ordering::Relaxed);
 
         if self.prompt_tokens > 0 {
             TOKENS_TOTAL

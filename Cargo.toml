@@ -8,7 +8,6 @@ description = "Shared infrastructure for Tangle inference blueprints"
 alloy = { version = "1", features = ["provider-http", "signer-local", "contract", "sol-types"] }
 anyhow = "1"
 axum = "0.7"
-config = "0.14"
 hex = "0.4"
 k256 = { version = "0.13", features = ["ecdsa"] }
 prometheus = "0.13"

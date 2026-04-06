@@ -41,8 +41,11 @@ pub struct PerTokenCostModel {
 
 impl CostModel for PerTokenCostModel {
     fn calculate_cost(&self, params: &CostParams) -> u64 {
-        (params.prompt_tokens as u64) * self.price_per_input_token
-            + (params.completion_tokens as u64) * self.price_per_output_token
+        (params.prompt_tokens as u64)
+            .saturating_mul(self.price_per_input_token)
+            .saturating_add(
+                (params.completion_tokens as u64).saturating_mul(self.price_per_output_token),
+            )
     }
 }
 
@@ -55,7 +58,7 @@ pub struct PerCharCostModel {
 impl CostModel for PerCharCostModel {
     fn calculate_cost(&self, params: &CostParams) -> u64 {
         let chars = params.extra.get("characters").copied().unwrap_or(0);
-        (chars * self.price_per_1k_chars) / 1000
+        chars.saturating_mul(self.price_per_1k_chars) / 1000
     }
 }
 
@@ -69,7 +72,7 @@ pub struct PerSecondCostModel {
 impl CostModel for PerSecondCostModel {
     fn calculate_cost(&self, params: &CostParams) -> u64 {
         let centiseconds = params.extra.get("centiseconds").copied().unwrap_or(0);
-        (centiseconds * self.price_per_second) / 100
+        centiseconds.saturating_mul(self.price_per_second) / 100
     }
 }
 
@@ -82,7 +85,7 @@ pub struct PerImageCostModel {
 impl CostModel for PerImageCostModel {
     fn calculate_cost(&self, params: &CostParams) -> u64 {
         let images = params.extra.get("images").copied().unwrap_or(1);
-        images * self.price_per_image
+        images.saturating_mul(self.price_per_image)
     }
 }
 

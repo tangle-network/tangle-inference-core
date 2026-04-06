@@ -72,8 +72,8 @@ impl NonceStore {
         }
     }
 
-    /// Evict expired nonces and check if the key is already used.
-    /// Returns true if replay detected (nonce already seen).
+    /// Check if the nonce is already used. Does NOT insert — use
+    /// `check_and_insert` for the atomic check+insert pattern.
     pub async fn check_replay(&self, key: &NonceKey, tolerance: u64) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -84,7 +84,36 @@ impl NonceStore {
         nonces.contains_key(key)
     }
 
+    /// Atomically check if a nonce is already used AND insert it if not.
+    /// Returns `true` if the nonce was already present (replay detected).
+    /// Returns `false` if the nonce was fresh and has been recorded.
+    ///
+    /// This is the primary API for replay protection — it holds the write
+    /// lock across both the check and the insert, preventing TOCTOU races
+    /// where two concurrent requests with the same nonce could both pass
+    /// a separate check_replay before either inserts.
+    pub async fn check_and_insert(
+        &self,
+        key: NonceKey,
+        expiry: u64,
+        tolerance: u64,
+    ) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut nonces = self.nonces.write().await;
+        nonces.retain(|_, exp| now <= exp.saturating_add(tolerance));
+        if nonces.contains_key(&key) {
+            return true; // replay
+        }
+        nonces.insert(key, expiry);
+        self.persist(&nonces);
+        false // fresh
+    }
+
     /// Record a nonce as used, evict expired entries, and persist to disk.
+    /// Prefer `check_and_insert` for the atomic check+insert pattern.
     pub async fn insert(&self, key: NonceKey, expiry: u64, tolerance: u64) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -129,6 +158,25 @@ pub struct AccountGuard {
 }
 
 impl AccountGuard {
+    /// Create a guard that increments the per-account counter NOW and
+    /// decrements it on drop. This ensures the counter is always balanced
+    /// regardless of early returns or panics in the caller.
+    pub async fn acquire(
+        commitment: String,
+        active: Arc<RwLock<HashMap<String, usize>>>,
+        max_per_account: usize,
+    ) -> Option<Self> {
+        let mut map = active.write().await;
+        let count = map.entry(commitment.clone()).or_insert(0);
+        if max_per_account > 0 && *count >= max_per_account {
+            return None; // at capacity
+        }
+        *count += 1;
+        drop(map);
+        Some(Self { commitment, active })
+    }
+
+    /// Create a guard without checking capacity (for backwards compat).
     pub fn new(commitment: String, active: Arc<RwLock<HashMap<String, usize>>>) -> Self {
         Self { commitment, active }
     }
@@ -511,11 +559,19 @@ pub async fn validate_spend_auth(
         }
     }
 
-    // Nonce replay check + record
+    // Atomic nonce check + insert — holds the write lock across both
+    // operations to prevent TOCTOU races where two concurrent requests
+    // with the same nonce could both pass a separate check before either
+    // inserts. If downstream validation fails, we've "wasted" a nonce,
+    // which is safe (the client can always generate a new one).
     let nonce_key = (spend_auth.commitment.clone(), spend_auth.nonce);
     if state
         .nonce_store
-        .check_replay(&nonce_key, state.billing_config.clock_skew_tolerance_secs)
+        .check_and_insert(
+            nonce_key,
+            spend_auth.expiry,
+            state.billing_config.clock_skew_tolerance_secs,
+        )
         .await
     {
         return Err(error_response(
@@ -525,18 +581,6 @@ pub async fn validate_spend_auth(
             "nonce_replay",
         ));
     }
-    // Record nonce as used BEFORE serving — prevents double-spend if a
-    // concurrent request arrives with the same nonce while we're still
-    // processing. If downstream validation fails we've "wasted" a nonce,
-    // which is safe (the client can always generate a new one).
-    state
-        .nonce_store
-        .insert(
-            nonce_key,
-            spend_auth.expiry,
-            state.billing_config.clock_skew_tolerance_secs,
-        )
-        .await;
 
     // Recover signer
     let recovered_address = crate::billing::recover_spend_auth_signer(
@@ -597,12 +641,15 @@ pub async fn validate_spend_auth(
 
 /// Settle billing after successful inference. Calculates the actual cost,
 /// caps at pre-authorized amount, and claims payment on-chain.
+///
+/// Returns an error if `claim_payment` fails after all retries so callers
+/// can log / alert appropriately.
 pub async fn settle_billing(
     billing: &BillingClient,
     spend_auth: &SpendAuthPayload,
     preauth_amount: u64,
     actual_cost: u64,
-) {
+) -> Result<(), anyhow::Error> {
     let charge_amount = actual_cost.min(preauth_amount);
 
     tracing::info!(
@@ -613,12 +660,8 @@ pub async fn settle_billing(
     );
 
     if charge_amount > 0 {
-        if let Err(e) = billing.claim_payment(spend_auth, charge_amount).await {
-            tracing::error!(
-                error = %e,
-                charge_amount,
-                "billing settlement failed — revenue lost"
-            );
-        }
+        billing.claim_payment(spend_auth, charge_amount).await?;
     }
+
+    Ok(())
 }
