@@ -109,7 +109,7 @@ pub struct BillingConfig {
     #[serde(default = "default_nonce_store_path")]
     pub nonce_store_path: Option<PathBuf>,
 
-    /// ERC-20 token address for x402 payment (e.g. tsUSD).
+    /// ERC-20 token address for x402 payment (e.g. USDC wrapped via VAnchor).
     #[serde(default)]
     pub payment_token_address: Option<String>,
 }
