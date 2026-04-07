@@ -12,9 +12,9 @@ pub mod server;
 // Re-exports — gated by feature
 #[cfg(feature = "billing")]
 pub use billing::{
-    BillingClient, CostModel, CostParams, FlatRequestCostModel, PerCharCostModel,
-    PerImageCostModel, PerSecondCostModel, PerTokenCostModel, TaskTypeCostModel,
-    recover_spend_auth_signer, verify_spend_auth_signature,
+    recover_spend_auth_signer, verify_spend_auth_signature, BillingClient, CostModel, CostParams,
+    FlatRequestCostModel, PerCharCostModel, PerImageCostModel, PerSecondCostModel,
+    PerTokenCostModel, TaskTypeCostModel,
 };
 #[cfg(feature = "metrics")]
 pub use metrics::{gather, health_summary, on_chain_metrics, RequestGuard};

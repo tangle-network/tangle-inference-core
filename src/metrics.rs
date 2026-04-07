@@ -346,9 +346,7 @@ impl Drop for RequestGuard {
             let elapsed_secs = self.start.elapsed().as_secs_f64();
             if elapsed_secs > 0.0 {
                 let tps = self.completion_tokens as f64 / elapsed_secs;
-                TOKENS_PER_SECOND
-                    .with_label_values(&[&self.model])
-                    .set(tps);
+                TOKENS_PER_SECOND.with_label_values(&[&self.model]).set(tps);
             }
         }
 

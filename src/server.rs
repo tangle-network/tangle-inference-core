@@ -93,12 +93,7 @@ impl NonceStore {
     /// lock across both the check and the insert, preventing TOCTOU races
     /// where two concurrent requests with the same nonce could both pass
     /// a separate check_replay before either inserts.
-    pub async fn check_and_insert(
-        &self,
-        key: NonceKey,
-        expiry: u64,
-        tolerance: u64,
-    ) -> bool {
+    pub async fn check_and_insert(&self, key: NonceKey, expiry: u64, tolerance: u64) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -387,7 +382,10 @@ fn de_u64_flex<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64,
     use serde::Deserialize as _;
     #[derive(serde::Deserialize)]
     #[serde(untagged)]
-    enum N { Num(u64), Str(String) }
+    enum N {
+        Num(u64),
+        Str(String),
+    }
     match N::deserialize(deserializer)? {
         N::Num(n) => Ok(n),
         N::Str(s) => s.parse::<u64>().map_err(serde::de::Error::custom),
@@ -398,7 +396,10 @@ fn de_u8_flex<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8, D
     use serde::Deserialize as _;
     #[derive(serde::Deserialize)]
     #[serde(untagged)]
-    enum N { Num(u8), Str(String) }
+    enum N {
+        Num(u8),
+        Str(String),
+    }
     match N::deserialize(deserializer)? {
         N::Num(n) => Ok(n),
         N::Str(s) => s.parse::<u8>().map_err(serde::de::Error::custom),
@@ -442,7 +443,12 @@ pub struct ErrorDetail {
 }
 
 /// Build a standard JSON error response.
-pub fn error_response(status: StatusCode, message: String, error_type: &str, code: &str) -> Response {
+pub fn error_response(
+    status: StatusCode,
+    message: String,
+    error_type: &str,
+    code: &str,
+) -> Response {
     let body = ErrorResponse {
         error: ErrorDetail {
             message,
@@ -647,8 +653,7 @@ pub async fn validate_spend_auth(
             }
 
             let min_balance = state.billing_config.min_credit_balance;
-            if min_balance > 0
-                && account_info.balance < alloy::primitives::U256::from(min_balance)
+            if min_balance > 0 && account_info.balance < alloy::primitives::U256::from(min_balance)
             {
                 return Err(error_response(
                     StatusCode::PAYMENT_REQUIRED,
@@ -696,8 +701,8 @@ pub async fn metrics_handler() -> Response {
 }
 
 /// GPU health endpoint handler. Returns detected GPU info.
-pub async fn gpu_health_handler(
-) -> Result<Json<Vec<crate::health::GpuInfo>>, (StatusCode, String)> {
+pub async fn gpu_health_handler() -> Result<Json<Vec<crate::health::GpuInfo>>, (StatusCode, String)>
+{
     match crate::health::detect_gpus().await {
         Ok(gpus) => Ok(Json(gpus)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
@@ -706,9 +711,7 @@ pub async fn gpu_health_handler(
 
 /// Try to acquire a semaphore permit from AppState. Returns 429 on failure.
 #[allow(clippy::result_large_err)]
-pub fn acquire_permit(
-    state: &AppState,
-) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
+pub fn acquire_permit(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
     state.semaphore.clone().try_acquire_owned().map_err(|_| {
         error_response(
             StatusCode::TOO_MANY_REQUESTS,

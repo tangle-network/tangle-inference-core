@@ -68,8 +68,8 @@ async fn app_state_builder_constructs_and_clones_across_tasks() {
     let tmp = tempfile::tempdir().unwrap();
     let nonce_path = tmp.path().join("nonces.json");
 
-    let billing = BillingClient::new(&test_tangle_config(), &test_billing_config())
-        .expect("billing client");
+    let billing =
+        BillingClient::new(&test_tangle_config(), &test_billing_config()).expect("billing client");
     let operator = billing.operator_address();
 
     let state = AppStateBuilder::new()
@@ -167,7 +167,9 @@ fn per_char_cost_model() {
 
 #[test]
 fn per_second_cost_model() {
-    let m = PerSecondCostModel { price_per_second: 1_000 };
+    let m = PerSecondCostModel {
+        price_per_second: 1_000,
+    };
     let mut extra = HashMap::new();
     // 250 centiseconds = 2.5 seconds.
     extra.insert("centiseconds".into(), 250);
@@ -181,7 +183,9 @@ fn per_second_cost_model() {
 
 #[test]
 fn per_image_cost_model() {
-    let m = PerImageCostModel { price_per_image: 7_500 };
+    let m = PerImageCostModel {
+        price_per_image: 7_500,
+    };
     let mut extra = HashMap::new();
     extra.insert("images".into(), 3);
     let cost = m.calculate_cost(&CostParams {
@@ -196,7 +200,9 @@ fn per_image_cost_model() {
 
 #[test]
 fn flat_request_cost_model() {
-    let m = FlatRequestCostModel { price_per_request: 999 };
+    let m = FlatRequestCostModel {
+        price_per_request: 999,
+    };
     assert_eq!(m.calculate_cost(&CostParams::default()), 999);
     assert_eq!(
         m.calculate_cost(&CostParams {
@@ -213,11 +219,15 @@ fn task_type_cost_model_dispatches_by_task() {
     let mut per_task: HashMap<String, Box<dyn CostModel>> = HashMap::new();
     per_task.insert(
         "tts".into(),
-        Box::new(PerCharCostModel { price_per_1k_chars: 4_000 }),
+        Box::new(PerCharCostModel {
+            price_per_1k_chars: 4_000,
+        }),
     );
     per_task.insert(
         "image".into(),
-        Box::new(PerImageCostModel { price_per_image: 50_000 }),
+        Box::new(PerImageCostModel {
+            price_per_image: 50_000,
+        }),
     );
 
     let model = TaskTypeCostModel {
@@ -359,11 +369,19 @@ fn spend_auth_signature_round_trip() {
         recover_spend_auth_signer(&payload, shielded_credits_addr, chain_id, 30).unwrap();
     assert_eq!(recovered, signing_address);
 
-    verify_spend_auth_signature(&payload, signing_address, shielded_credits_addr, chain_id, 30)
-        .expect("matching signer");
+    verify_spend_auth_signature(
+        &payload,
+        signing_address,
+        shielded_credits_addr,
+        chain_id,
+        30,
+    )
+    .expect("matching signer");
 
     // Mismatched expected key -> Err.
-    let other: Address = "0x000000000000000000000000000000000000bEEF".parse().unwrap();
+    let other: Address = "0x000000000000000000000000000000000000bEEF"
+        .parse()
+        .unwrap();
     assert!(
         verify_spend_auth_signature(&payload, other, shielded_credits_addr, chain_id, 30).is_err()
     );
@@ -394,8 +412,8 @@ async fn nonce_store_persists_across_reload() {
 // --- Helpers for validate_spend_auth / payment_required / extract_x402 tests ---
 
 fn build_test_state() -> AppState {
-    let billing = BillingClient::new(&test_tangle_config(), &test_billing_config())
-        .expect("billing client");
+    let billing =
+        BillingClient::new(&test_tangle_config(), &test_billing_config()).expect("billing client");
     let operator = billing.operator_address();
     let tmp = tempfile::tempdir().unwrap();
     let nonce_path = tmp.path().join("nonces.json");

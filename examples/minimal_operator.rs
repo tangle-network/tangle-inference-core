@@ -182,8 +182,6 @@ async fn main() -> anyhow::Result<()> {
 fn tracing_subscriber_init() {
     // Examples shouldn't pull a heavy subscriber dep; this is enough.
     let _ = std::panic::catch_unwind(|| {
-        tracing::subscriber::set_global_default(
-            tracing::subscriber::NoSubscriber::default(),
-        )
+        tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default())
     });
 }
