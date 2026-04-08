@@ -131,3 +131,29 @@ mod tests {
         assert!(json["utilization_pct"].is_null());
     }
 }
+
+/// Returns TEE status for inclusion in health endpoints.
+/// Probes device files and env vars — safe to call repeatedly.
+pub fn tee_status() -> serde_json::Value {
+    let provider = detect_tee_provider_name();
+    serde_json::json!({
+        "active": provider.is_some(),
+        "provider": provider,
+    })
+}
+
+fn detect_tee_provider_name() -> Option<&'static str> {
+    if std::path::Path::new("/dev/nsm").exists() {
+        return Some("aws_nitro");
+    }
+    if std::path::Path::new("/dev/tdx-guest").exists() {
+        return Some("intel_tdx");
+    }
+    if std::path::Path::new("/dev/sev-guest").exists() {
+        return Some("amd_sev_snp");
+    }
+    if std::env::var("CONFIDENTIAL_SPACE_VERSION").is_ok() {
+        return Some("gcp_confidential_space");
+    }
+    None
+}

@@ -29,4 +29,4 @@ pub use settlement_queue::{FailedSettlement, SettlementRecoveryQueue};
 
 // Always available
 pub use config::{BillingConfig, GpuConfig, ServerConfig, TangleConfig};
-pub use health::{detect_gpus, parse_nvidia_smi_output, GpuInfo};
+pub use health::{detect_gpus, parse_nvidia_smi_output, tee_status, GpuInfo};
