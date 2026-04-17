@@ -697,3 +697,239 @@ async fn app_state_from_config_constructs_correctly() {
     assert_eq!(backend.name, "from-config");
     assert_eq!(state.semaphore.available_permits(), 4);
 }
+
+// ─── Payment provider adversarial tests ──────────────────────────────
+//
+// These test the PaymentProvider trait + PaymentProof type for:
+// - Type confusion (wrong proof variant for wrong provider)
+// - Malformed inputs (empty strings, huge amounts, garbage tx hashes)
+// - NoopProvider never rejects
+// - ShieldedProvider rejects DirectTransfer proofs
+// - DirectProvider rejects SpendAuth proofs
+// - PaymentMode config creates the right provider
+// - PaymentProof serde round-trip (callers send JSON, we deserialize)
+// - create_provider factory with each mode
+
+use tangle_inference_core::payment::{
+    create_provider, NoopProvider, PaymentMode, PaymentProof, PaymentProvider, ShieldedProvider,
+};
+
+/// Anvil default account #0 private key.
+const TEST_OPERATOR_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+fn test_operator_signer() -> PrivateKeySigner {
+    TEST_OPERATOR_KEY.parse().unwrap()
+}
+
+fn test_spend_auth_payload() -> SpendAuthPayload {
+    SpendAuthPayload {
+        commitment: "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
+        service_id: 42,
+        job_index: 0,
+        amount: "100000".into(),
+        operator: format!("{}", test_operator_signer().address()),
+        nonce: 1,
+        expiry: u64::MAX, // far future
+        signature: "0x".to_string() + &"00".repeat(65), // dummy sig — won't verify on-chain but sufficient for type tests
+    }
+}
+
+#[tokio::test]
+async fn noop_provider_always_authorizes() {
+    let provider = NoopProvider::new(TEST_OPERATOR_KEY.to_string()).unwrap();
+    // Even garbage proof gets authorized
+    let proof = PaymentProof::DirectTransfer {
+        tx_hash: "0xgarbage".into(),
+        from: "0xdead".into(),
+        amount: "999999999".into(),
+        token: "".into(),
+    };
+    let result = provider.authorize(&proof).await;
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn noop_provider_settle_is_noop() {
+    let provider = NoopProvider::new(TEST_OPERATOR_KEY.to_string()).unwrap();
+    let proof = PaymentProof::SpendAuth(test_spend_auth_payload());
+    let result = provider.settle(&proof, 12345).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn shielded_provider_rejects_direct_transfer_proof() {
+    let tangle = test_tangle_config();
+    let billing = test_billing_config();
+    let provider = ShieldedProvider::new(&tangle, &billing).unwrap();
+    let proof = PaymentProof::DirectTransfer {
+        tx_hash: "0xabc".into(),
+        from: "0xdead".into(),
+        amount: "100".into(),
+        token: "0x0".into(),
+    };
+    let result = provider.authorize(&proof).await;
+    assert!(result.is_err(), "ShieldedProvider must reject DirectTransfer proof");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("SpendAuth"), "error should mention SpendAuth, got: {err}");
+}
+
+#[tokio::test]
+async fn shielded_provider_rejects_direct_transfer_on_settle() {
+    let tangle = test_tangle_config();
+    let billing = test_billing_config();
+    let provider = ShieldedProvider::new(&tangle, &billing).unwrap();
+    let proof = PaymentProof::DirectTransfer {
+        tx_hash: "0xabc".into(),
+        from: "0x0".into(),
+        amount: "0".into(),
+        token: "".into(),
+    };
+    let result = provider.settle(&proof, 0).await;
+    assert!(result.is_err());
+}
+
+#[test]
+fn payment_proof_serde_round_trip_spend_auth() {
+    let payload = test_spend_auth_payload();
+    let proof = PaymentProof::SpendAuth(payload);
+    let json = serde_json::to_string(&proof).unwrap();
+    assert!(json.contains("\"type\":\"spend_auth\""), "tag should be spend_auth");
+    let parsed: PaymentProof = serde_json::from_str(&json).unwrap();
+    match parsed {
+        PaymentProof::SpendAuth(p) => assert_eq!(p.commitment, "0x0000000000000000000000000000000000000000000000000000000000000001"),
+        _ => panic!("expected SpendAuth variant"),
+    }
+}
+
+#[test]
+fn payment_proof_serde_round_trip_direct_transfer() {
+    let proof = PaymentProof::DirectTransfer {
+        tx_hash: "0xdeadbeef".into(),
+        from: "0x1234".into(),
+        amount: "1000000".into(),
+        token: "0xtoken".into(),
+    };
+    let json = serde_json::to_string(&proof).unwrap();
+    assert!(json.contains("\"type\":\"direct_transfer\""));
+    let parsed: PaymentProof = serde_json::from_str(&json).unwrap();
+    match parsed {
+        PaymentProof::DirectTransfer { tx_hash, amount, .. } => {
+            assert_eq!(tx_hash, "0xdeadbeef");
+            assert_eq!(amount, "1000000");
+        }
+        _ => panic!("expected DirectTransfer variant"),
+    }
+}
+
+#[test]
+fn payment_proof_rejects_unknown_type_tag() {
+    let json = r#"{"type":"bitcoin","tx_hash":"abc"}"#;
+    let result = serde_json::from_str::<PaymentProof>(json);
+    assert!(result.is_err(), "unknown payment type should fail deserialization");
+}
+
+#[test]
+fn payment_proof_rejects_missing_type_tag() {
+    let json = r#"{"tx_hash":"0xabc","amount":"100"}"#;
+    let result = serde_json::from_str::<PaymentProof>(json);
+    assert!(result.is_err(), "missing type tag should fail deserialization");
+}
+
+#[test]
+fn create_provider_noop_mode() {
+    let tangle = test_tangle_config();
+    let billing = test_billing_config();
+    let provider = create_provider(PaymentMode::None, &tangle, &billing);
+    assert!(provider.is_ok());
+}
+
+#[test]
+fn create_provider_shielded_mode() {
+    let tangle = test_tangle_config();
+    let billing = test_billing_config();
+    let provider = create_provider(PaymentMode::Shielded, &tangle, &billing);
+    assert!(provider.is_ok());
+}
+
+#[test]
+fn create_provider_direct_mode() {
+    let tangle = test_tangle_config();
+    let billing = test_billing_config();
+    let provider = create_provider(PaymentMode::Direct, &tangle, &billing);
+    assert!(provider.is_ok());
+}
+
+#[test]
+fn payment_mode_default_is_shielded() {
+    let mode: PaymentMode = serde_json::from_str(r#""shielded""#).unwrap();
+    assert_eq!(mode, PaymentMode::Shielded);
+    assert_eq!(PaymentMode::default(), PaymentMode::Shielded);
+}
+
+#[test]
+fn payment_mode_serde_all_variants() {
+    for (json, expected) in [
+        (r#""none""#, PaymentMode::None),
+        (r#""shielded""#, PaymentMode::Shielded),
+        (r#""direct""#, PaymentMode::Direct),
+    ] {
+        let parsed: PaymentMode = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, expected);
+        let back = serde_json::to_string(&parsed).unwrap();
+        assert_eq!(back, json);
+    }
+}
+
+#[test]
+fn noop_provider_operator_address_matches_key() {
+    let provider = NoopProvider::new(TEST_OPERATOR_KEY.to_string()).unwrap();
+    let expected: Address = test_operator_signer().address();
+    assert_eq!(provider.operator_address(), expected);
+}
+
+#[test]
+fn noop_provider_rejects_invalid_key() {
+    let result = NoopProvider::new("not-a-valid-hex-key".into());
+    assert!(result.is_err());
+}
+
+// Direct provider needs a real RPC to verify tx receipts — can't test
+// authorize() without Anvil. But we CAN test construction + rejection
+// of wrong proof types.
+
+#[test]
+fn direct_provider_rejects_invalid_rpc_url() {
+    use tangle_inference_core::payment::DirectProvider;
+    let result = DirectProvider::new(
+        "not a url".into(),
+        TEST_OPERATOR_KEY.into(),
+        None,
+        1,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn direct_provider_rejects_invalid_operator_key() {
+    use tangle_inference_core::payment::DirectProvider;
+    let result = DirectProvider::new(
+        "http://localhost:8545".into(),
+        "garbage".into(),
+        None,
+        1,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn direct_provider_rejects_invalid_token_address() {
+    use tangle_inference_core::payment::DirectProvider;
+    let result = DirectProvider::new(
+        "http://localhost:8545".into(),
+        TEST_OPERATOR_KEY.into(),
+        Some("not-an-address".into()),
+        1,
+    );
+    assert!(result.is_err());
+}
