@@ -149,21 +149,25 @@ impl NonceStore {
 }
 
 /// RAII guard that decrements the per-account active request count on drop.
+///
+/// Uses `std::sync::Mutex` (not tokio RwLock) for the counter map so Drop
+/// works without async — no spawned task, no lost decrements, no race.
+/// Counter operations are trivial (microseconds), so blocking is fine.
 pub struct AccountGuard {
     commitment: String,
-    active: Arc<RwLock<HashMap<String, usize>>>,
+    active: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 }
 
 impl AccountGuard {
     /// Create a guard that increments the per-account counter NOW and
     /// decrements it on drop. This ensures the counter is always balanced
     /// regardless of early returns or panics in the caller.
-    pub async fn acquire(
+    pub fn acquire(
         commitment: String,
-        active: Arc<RwLock<HashMap<String, usize>>>,
+        active: Arc<std::sync::Mutex<HashMap<String, usize>>>,
         max_per_account: usize,
     ) -> Option<Self> {
-        let mut map = active.write().await;
+        let mut map = active.lock().unwrap_or_else(|e| e.into_inner());
         let count = map.entry(commitment.clone()).or_insert(0);
         if max_per_account > 0 && *count >= max_per_account {
             return None; // at capacity
@@ -174,35 +178,20 @@ impl AccountGuard {
     }
 
     /// Create a guard without checking capacity (for backwards compat).
-    pub fn new(commitment: String, active: Arc<RwLock<HashMap<String, usize>>>) -> Self {
+    pub fn new(commitment: String, active: Arc<std::sync::Mutex<HashMap<String, usize>>>) -> Self {
         Self { commitment, active }
     }
 }
 
 impl Drop for AccountGuard {
     fn drop(&mut self) {
-        // Use try_write to avoid blocking in drop; if contended, spawn a task.
-        match self.active.try_write() {
-            Ok(mut map) => {
-                if let Some(count) = map.get_mut(&self.commitment) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        map.remove(&self.commitment);
-                    }
-                }
-            }
-            Err(_) => {
-                let commitment = self.commitment.clone();
-                let active = Arc::clone(&self.active);
-                tokio::spawn(async move {
-                    let mut map = active.write().await;
-                    if let Some(count) = map.get_mut(&commitment) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            map.remove(&commitment);
-                        }
-                    }
-                });
+        // std::sync::Mutex works in Drop — no async, no spawned task,
+        // no race, no lost decrements.
+        let mut map = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = map.get_mut(&self.commitment) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.commitment);
             }
         }
     }
@@ -222,7 +211,7 @@ pub struct AppState {
     pub tangle_config: Arc<TangleConfig>,
     pub operator_address: Address,
     pub semaphore: Arc<tokio::sync::Semaphore>,
-    pub active_per_account: Arc<RwLock<HashMap<String, usize>>>,
+    pub active_per_account: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     /// Persistent dead-letter queue for failed on-chain settlements.
     pub settlement_recovery_queue: Option<Arc<SettlementRecoveryQueue>>,
     /// Backend-specific state. Downcast via [`AppState::backend`].
@@ -404,7 +393,7 @@ impl AppStateBuilder {
             tangle_config,
             operator_address,
             semaphore,
-            active_per_account: Arc::new(RwLock::new(HashMap::new())),
+            active_per_account: Arc::new(std::sync::Mutex::new(HashMap::new())),
             settlement_recovery_queue: self.settlement_recovery_queue,
             payment_provider,
             backend,

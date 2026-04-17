@@ -159,7 +159,7 @@ impl DirectProvider {
 #[async_trait]
 impl PaymentProvider for DirectProvider {
     async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
-        let PaymentProof::DirectTransfer { tx_hash, from: _, amount, token: _ } = proof else {
+        let PaymentProof::DirectTransfer { tx_hash, from, amount, token: _ } = proof else {
             anyhow::bail!("DirectProvider requires DirectTransfer proof, got {:?}", std::mem::discriminant(proof));
         };
 
@@ -229,6 +229,23 @@ impl PaymentProvider for DirectProvider {
             // Token MUST match the configured expected_token (no longer optional)
             if log.address() != self.expected_token {
                 continue;
+            }
+
+            // Verify sender matches the claimed `from` (if provided)
+            if !from.is_empty() {
+                if let Ok(claimed_from) = from.parse::<Address>() {
+                    let actual_from = Address::from_slice(&topics[1].as_slice()[12..]);
+                    if actual_from != claimed_from {
+                        tracing::warn!(
+                            tx_hash,
+                            claimed_from = %claimed_from,
+                            actual_from = %actual_from,
+                            "DirectTransfer 'from' mismatch — claimed sender differs from actual Transfer sender"
+                        );
+                        // Don't reject — the payment is still valid (operator got paid).
+                        // But log it for fraud detection.
+                    }
+                }
             }
 
             // data = amount (uint256). Cap at u64::MAX (safe — only inflates,
