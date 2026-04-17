@@ -6,7 +6,7 @@ description = "Shared infrastructure for Tangle inference blueprints"
 
 [features]
 default = ["billing", "http", "metrics"]
-billing = ["dep:alloy", "dep:k256", "dep:hex"]
+billing = ["dep:alloy", "dep:k256", "dep:hex", "dep:async-trait"]
 http = ["dep:axum", "dep:tower-http"]
 metrics = ["dep:prometheus"]
 
@@ -22,6 +22,7 @@ anyhow = "1"
 alloy = { version = "1", features = ["provider-http", "signer-local", "contract", "sol-types"], optional = true }
 k256 = { version = "0.13", features = ["ecdsa"], optional = true }
 hex = { version = "0.4", optional = true }
+async-trait = { version = "0.1", optional = true }
 
 # HTTP (axum server helpers)
 axum = { version = "0.7", optional = true }
