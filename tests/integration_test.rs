@@ -51,6 +51,7 @@ fn test_tangle_config() -> TangleConfig {
 
 fn test_billing_config() -> BillingConfig {
     BillingConfig {
+        payment_mode: tangle_inference_core::PaymentMode::Shielded,
         billing_required: true,
         max_spend_per_request: 1_000_000,
         min_credit_balance: 1_000,

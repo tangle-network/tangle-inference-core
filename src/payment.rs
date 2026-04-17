@@ -314,23 +314,8 @@ impl PaymentProvider for NoopProvider {
 
 // ─── Factory ──────────────────────────────────────────────────────────
 
-/// Payment mode selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PaymentMode {
-    /// No billing — open endpoint.
-    None,
-    /// ShieldedCredits (existing path).
-    Shielded,
-    /// Direct ERC-20 transfer verification.
-    Direct,
-}
-
-impl Default for PaymentMode {
-    fn default() -> Self {
-        Self::Shielded
-    }
-}
+// Re-export PaymentMode from config so consumers can import from payment module
+pub use crate::config::PaymentMode;
 
 /// Create a payment provider from config.
 pub fn create_provider(

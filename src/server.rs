@@ -14,6 +14,7 @@ use tokio::sync::RwLock;
 
 use crate::billing::BillingClient;
 use crate::config::{BillingConfig, ServerConfig, TangleConfig};
+use crate::payment::{PaymentProvider, PaymentProof, create_provider};
 use crate::settlement_queue::{FailedSettlement, SettlementRecoveryQueue};
 
 // x402 header constants
@@ -226,6 +227,10 @@ pub struct AppState {
     pub settlement_recovery_queue: Option<Arc<SettlementRecoveryQueue>>,
     /// Backend-specific state. Downcast via [`AppState::backend`].
     pub backend: Arc<dyn std::any::Any + Send + Sync>,
+    /// Generic payment provider (replaces direct BillingClient usage).
+    /// Supports ShieldedCredits, DirectTransfer, or NoOp depending on config.
+    /// New blueprints should use this instead of `billing` directly.
+    pub payment_provider: Arc<dyn PaymentProvider>,
 }
 
 impl AppState {
@@ -250,6 +255,9 @@ impl AppState {
         let operator_address = billing_client.operator_address();
         let nonce_store = Arc::new(NonceStore::load(billing.nonce_store_path.clone()));
 
+        // Create payment provider from config's payment_mode
+        let provider = create_provider(billing.payment_mode, tangle, billing)?;
+
         AppStateBuilder::new()
             .billing(Arc::new(billing_client))
             .nonce_store(nonce_store)
@@ -258,6 +266,7 @@ impl AppState {
             .tangle_config(Arc::new(tangle.clone()))
             .operator_address(operator_address)
             .max_concurrent(max_concurrent)
+            .payment_provider(Arc::from(provider) as Arc<dyn PaymentProvider>)
             .backend(backend)
             .build()
     }
@@ -276,6 +285,7 @@ pub struct AppStateBuilder {
     operator_address: Option<Address>,
     max_concurrent: Option<usize>,
     settlement_recovery_queue: Option<Arc<SettlementRecoveryQueue>>,
+    payment_provider: Option<Arc<dyn PaymentProvider>>,
     backend: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
@@ -324,6 +334,11 @@ impl AppStateBuilder {
         self
     }
 
+    pub fn payment_provider(mut self, p: Arc<dyn PaymentProvider>) -> Self {
+        self.payment_provider = Some(p);
+        self
+    }
+
     /// Attach a backend value of any type. Retrieve in handlers via
     /// `state.backend::<MyBackend>().unwrap()`.
     pub fn backend<B: Send + Sync + 'static>(mut self, b: B) -> Self {
@@ -359,6 +374,28 @@ impl AppStateBuilder {
             .unwrap_or(server_config.max_concurrent_requests);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
 
+        // Payment provider: use explicit if provided, otherwise create NoopProvider
+        // as fallback (blueprints using from_config always get the right one).
+        let payment_provider = match self.payment_provider {
+            Some(p) => p,
+            None => {
+                // Fallback: create from config if available, or noop
+                let mode = billing_config.payment_mode;
+                match create_provider(mode, &tangle_config, &billing_config) {
+                    Ok(p) => {
+                        let p: Arc<dyn PaymentProvider> = Arc::from(p);
+                        p
+                    }
+                    Err(_) => {
+                        // If provider creation fails (e.g. Direct without token),
+                        // fall back to a ShieldedProvider wrapping the billing client.
+                        Arc::new(crate::payment::ShieldedProvider::new(&tangle_config, &billing_config)?)
+                            as Arc<dyn PaymentProvider>
+                    }
+                }
+            }
+        };
+
         Ok(AppState {
             billing,
             nonce_store,
@@ -369,6 +406,7 @@ impl AppStateBuilder {
             semaphore,
             active_per_account: Arc::new(RwLock::new(HashMap::new())),
             settlement_recovery_queue: self.settlement_recovery_queue,
+            payment_provider,
             backend,
         })
     }
@@ -720,6 +758,67 @@ pub fn acquire_permit(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePer
             "too_many_requests",
         )
     })
+}
+
+/// Generic payment gate — works with any PaymentProvider.
+///
+/// Extracts payment proof from the request body (either `spend_auth` for
+/// ShieldedCredits or `payment` for DirectTransfer), validates via the
+/// provider's `authorize()`, returns the proof + authorized amount.
+///
+/// New blueprints should use this instead of `billing_gate`.
+pub async fn payment_gate(
+    provider: &dyn PaymentProvider,
+    billing_config: &BillingConfig,
+    headers: &HeaderMap,
+    body_spend_auth: Option<SpendAuthPayload>,
+    body_payment: Option<PaymentProof>,
+    estimated_cost: u64,
+) -> Result<(Option<PaymentProof>, Option<u64>), Response> {
+    // Try to extract payment proof from multiple sources
+    let proof = if let Some(p) = body_payment {
+        Some(p)
+    } else if let Some(sa) = body_spend_auth {
+        Some(PaymentProof::SpendAuth(sa))
+    } else if let Some(sa) = extract_x402_spend_auth(headers) {
+        Some(PaymentProof::SpendAuth(sa))
+    } else {
+        None
+    };
+
+    if billing_config.billing_required && proof.is_none() {
+        return Err(error_response(
+            StatusCode::PAYMENT_REQUIRED,
+            format!("payment required — estimated cost: {estimated_cost}"),
+            "billing_error",
+            "payment_required",
+        ));
+    }
+
+    let Some(proof) = proof else {
+        return Ok((None, None));
+    };
+
+    match provider.authorize(&proof).await {
+        Ok(amount) => Ok((Some(proof), Some(amount))),
+        Err(e) => Err(error_response(
+            StatusCode::PAYMENT_REQUIRED,
+            format!("payment authorization failed: {e}"),
+            "billing_error",
+            "authorization_failed",
+        )),
+    }
+}
+
+/// Settle payment after inference. Works with any PaymentProvider.
+///
+/// New blueprints should use this instead of `settle_billing`.
+pub async fn settle_payment(
+    provider: &dyn PaymentProvider,
+    proof: &PaymentProof,
+    actual_cost: u64,
+) -> Result<(), anyhow::Error> {
+    provider.settle(proof, actual_cost).await
 }
 
 /// Full billing gate: extract SpendAuth from body or x402 header, enforce

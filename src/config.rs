@@ -75,10 +75,32 @@ pub struct ServerConfig {
     pub max_per_account_requests: usize,
 }
 
-/// Billing / ShieldedCredits configuration.
+/// Payment mode — which payment provider to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentMode {
+    /// No billing — open endpoint.
+    None,
+    /// ShieldedCredits (default, backward compatible).
+    Shielded,
+    /// Direct ERC-20 transfer verification.
+    Direct,
+}
+
+impl Default for PaymentMode {
+    fn default() -> Self {
+        Self::Shielded
+    }
+}
+
+/// Billing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BillingConfig {
-    /// Whether billing (spend_auth) is required on every request.
+    /// Payment mode: "none", "shielded" (default), or "direct".
+    #[serde(default)]
+    pub payment_mode: PaymentMode,
+
+    /// Whether billing (spend_auth / direct transfer) is required on every request.
     #[serde(default = "default_billing_required")]
     pub billing_required: bool,
 

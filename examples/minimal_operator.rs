@@ -124,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         service_id: Some(42),
     };
     let billing_cfg = BillingConfig {
+        payment_mode: tangle_inference_core::PaymentMode::Shielded,
         billing_required: true,
         max_spend_per_request: 1_000_000,
         min_credit_balance: 1_000,

@@ -28,9 +28,9 @@ pub use metrics::{gather, health_summary, on_chain_metrics, RequestGuard};
 #[cfg(all(feature = "http", feature = "billing"))]
 pub use server::{
     acquire_permit, billing_gate, error_response, extract_x402_spend_auth, gpu_health_handler,
-    metrics_handler, payment_required, settle_billing, settle_billing_with_recovery,
-    validate_spend_auth, AccountGuard, AppState, AppStateBuilder, ErrorDetail, ErrorResponse,
-    NonceStore, SpendAuthPayload,
+    metrics_handler, payment_gate, payment_required, settle_billing, settle_billing_with_recovery,
+    settle_payment, validate_spend_auth, AccountGuard, AppState, AppStateBuilder, ErrorDetail,
+    ErrorResponse, NonceStore, SpendAuthPayload,
 };
 pub use settlement_queue::{FailedSettlement, SettlementRecoveryQueue};
 
