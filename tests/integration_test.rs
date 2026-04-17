@@ -853,10 +853,15 @@ fn create_provider_shielded_mode() {
 }
 
 #[test]
-fn create_provider_direct_mode() {
+fn create_provider_direct_mode_requires_token() {
     let tangle = test_tangle_config();
-    let billing = test_billing_config();
+    let billing = test_billing_config(); // no payment_token_address
     let provider = create_provider(PaymentMode::Direct, &tangle, &billing);
+    assert!(provider.is_err(), "direct mode without token must fail");
+
+    let mut billing_with_token = test_billing_config();
+    billing_with_token.payment_token_address = Some("0x0000000000000000000000000000000000000001".into());
+    let provider = create_provider(PaymentMode::Direct, &tangle, &billing_with_token);
     assert!(provider.is_ok());
 }
 
@@ -1142,6 +1147,63 @@ mod anvil_e2e {
     }
 
     #[tokio::test]
+    async fn direct_provider_rejects_tx_hash_replay() {
+        if std::env::var("ANVIL_E2E").unwrap_or_default() != "1" {
+            eprintln!("skipping anvil e2e (set ANVIL_E2E=1)");
+            return;
+        }
+
+        let anvil = AnvilInstance::spawn();
+        let rpc = anvil.rpc_url();
+
+        let deployer_signer: PrivateKeySigner = TEST_OPERATOR_KEY.parse().unwrap();
+        let deployer_wallet = EthereumWallet::from(deployer_signer.clone());
+        let deployer_provider = ProviderBuilder::new()
+            .wallet(deployer_wallet)
+            .connect_http(rpc.parse().unwrap());
+
+        let token = TestToken::deploy(&deployer_provider).await.unwrap();
+        let token_addr = *token.address();
+
+        let caller_signer: PrivateKeySigner = CALLER_KEY.parse().unwrap();
+        let caller_addr = caller_signer.address();
+        token.mint(caller_addr, U256::from(10_000u64)).send().await.unwrap().get_receipt().await.unwrap();
+
+        let caller_wallet = EthereumWallet::from(caller_signer);
+        let caller_provider = ProviderBuilder::new()
+            .wallet(caller_wallet)
+            .connect_http(rpc.parse().unwrap());
+        let caller_token = TestToken::new(token_addr, &caller_provider);
+
+        let tx_receipt = caller_token
+            .transfer(deployer_signer.address(), U256::from(5_000u64))
+            .send().await.unwrap()
+            .get_receipt().await.unwrap();
+
+        let tx_hash = format!("{:#x}", tx_receipt.transaction_hash);
+
+        let provider = DirectProvider::new(
+            rpc, TEST_OPERATOR_KEY.into(), Some(format!("{:#x}", token_addr)), 0,
+        ).unwrap();
+
+        let proof = PaymentProof::DirectTransfer {
+            tx_hash: tx_hash.clone(),
+            from: format!("{:#x}", caller_addr),
+            amount: "5000".into(),
+            token: format!("{:#x}", token_addr),
+        };
+
+        // First use: should succeed
+        let first = provider.authorize(&proof).await;
+        assert!(first.is_ok(), "first use should succeed: {:?}", first.err());
+
+        // Second use: MUST be rejected (replay)
+        let second = provider.authorize(&proof).await;
+        assert!(second.is_err(), "CRITICAL: tx_hash replay must be rejected");
+        assert!(second.unwrap_err().to_string().contains("replay"), "error should mention replay");
+    }
+
+    #[tokio::test]
     async fn direct_provider_rejects_nonexistent_tx() {
         if std::env::var("ANVIL_E2E").unwrap_or_default() != "1" {
             eprintln!("skipping anvil e2e (set ANVIL_E2E=1)");
@@ -1150,7 +1212,8 @@ mod anvil_e2e {
 
         let anvil = AnvilInstance::spawn();
         let provider = DirectProvider::new(
-            anvil.rpc_url(), TEST_OPERATOR_KEY.into(), None, 0,
+            anvil.rpc_url(), TEST_OPERATOR_KEY.into(),
+            Some("0x0000000000000000000000000000000000000001".into()), 0,
         ).unwrap();
 
         let proof = PaymentProof::DirectTransfer {
@@ -1169,12 +1232,26 @@ mod anvil_e2e {
 // ─── Direct provider construction tests (no Anvil needed) ─────────────
 
 #[test]
+fn direct_provider_rejects_missing_token() {
+    use tangle_inference_core::payment::DirectProvider;
+    let result = DirectProvider::new(
+        "http://localhost:8545".into(),
+        TEST_OPERATOR_KEY.into(),
+        None, // no token = must fail
+        1,
+    );
+    assert!(result.is_err(), "DirectProvider MUST require a payment token");
+    let err = format!("{}", result.err().unwrap());
+    assert!(err.contains("requires payment_token"), "error should mention token requirement, got: {err}");
+}
+
+#[test]
 fn direct_provider_rejects_invalid_rpc_url() {
     use tangle_inference_core::payment::DirectProvider;
     let result = DirectProvider::new(
         "not a url".into(),
         TEST_OPERATOR_KEY.into(),
-        None,
+        Some("0x0000000000000000000000000000000000000001".into()),
         1,
     );
     assert!(result.is_err());
@@ -1186,7 +1263,7 @@ fn direct_provider_rejects_invalid_operator_key() {
     let result = DirectProvider::new(
         "http://localhost:8545".into(),
         "garbage".into(),
-        None,
+        Some("0x0000000000000000000000000000000000000001".into()),
         1,
     );
     assert!(result.is_err());

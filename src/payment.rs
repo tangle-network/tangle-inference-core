@@ -119,8 +119,14 @@ impl PaymentProvider for ShieldedProvider {
 pub struct DirectProvider {
     rpc_url: reqwest::Url,
     operator_address: Address,
-    expected_token: Option<Address>,
+    /// Required — operators MUST pin a specific ERC-20 token to accept.
+    /// Without this, an attacker deploys a worthless token and pays with it.
+    expected_token: Address,
     min_confirmations: u64,
+    /// Replay protection — tracks used tx hashes. A tx_hash can only
+    /// authorize one request. Without this, one real transfer = unlimited
+    /// free inference.
+    used_tx_hashes: tokio::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 impl DirectProvider {
@@ -133,9 +139,11 @@ impl DirectProvider {
         use alloy::signers::local::PrivateKeySigner;
         let signer: PrivateKeySigner = operator_key.parse()?;
         let operator_address = signer.address();
-        let expected_token = payment_token
-            .map(|t| t.parse::<Address>())
-            .transpose()
+        let expected_token: Address = payment_token
+            .ok_or_else(|| anyhow::anyhow!(
+                "DirectProvider requires payment_token_address — without it, an attacker can pay with a worthless token"
+            ))?
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid payment token address: {e}"))?;
 
         Ok(Self {
@@ -143,6 +151,7 @@ impl DirectProvider {
             operator_address,
             expected_token,
             min_confirmations,
+            used_tx_hashes: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         })
     }
 }
@@ -150,12 +159,21 @@ impl DirectProvider {
 #[async_trait]
 impl PaymentProvider for DirectProvider {
     async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
-        let PaymentProof::DirectTransfer { tx_hash, from: _, amount, token } = proof else {
+        let PaymentProof::DirectTransfer { tx_hash, from: _, amount, token: _ } = proof else {
             anyhow::bail!("DirectProvider requires DirectTransfer proof, got {:?}", std::mem::discriminant(proof));
         };
 
-        use alloy::providers::{Provider, ProviderBuilder};
+        // ── Replay protection: each tx_hash can only authorize ONE request ──
+        {
+            let mut used = self.used_tx_hashes.write().await;
+            if used.contains(tx_hash) {
+                anyhow::bail!("tx_hash {tx_hash} already used — replay rejected");
+            }
+            // Insert BEFORE verification so a concurrent request can't race past
+            used.insert(tx_hash.clone());
+        }
 
+        use alloy::providers::{Provider, ProviderBuilder};
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.clone());
 
         // Parse tx hash
@@ -168,8 +186,11 @@ impl PaymentProvider for DirectProvider {
             .await?
             .ok_or_else(|| anyhow::anyhow!("tx {tx_hash} not found — not yet confirmed?"))?;
 
-        // Check confirmations
-        if let Some(block_number) = receipt.block_number {
+        // ── Require block_number (reject pending/unconfirmed txs) ──
+        let block_number = receipt.block_number
+            .ok_or_else(|| anyhow::anyhow!("tx {tx_hash} has no block number — pending or unconfirmed"))?;
+
+        if self.min_confirmations > 0 {
             let current_block = provider.get_block_number().await?;
             let confirmations = current_block.saturating_sub(block_number);
             if confirmations < self.min_confirmations {
@@ -185,8 +206,7 @@ impl PaymentProvider for DirectProvider {
             anyhow::bail!("tx {tx_hash} reverted");
         }
 
-        // Verify it's a transfer to our operator address by checking logs.
-        // ERC-20 Transfer event: Transfer(address from, address to, uint256 value)
+        // ── Verify ERC-20 Transfer to operator with the REQUIRED token ──
         let transfer_topic = alloy::primitives::keccak256(b"Transfer(address,address,uint256)");
         let mut found_amount: u64 = 0;
         let mut found = false;
@@ -206,24 +226,13 @@ impl PaymentProvider for DirectProvider {
                 continue;
             }
 
-            // Check token address if configured
-            let log_addr = log.address();
-            if let Some(expected) = self.expected_token {
-                if log_addr != expected {
-                    continue;
-                }
+            // Token MUST match the configured expected_token (no longer optional)
+            if log.address() != self.expected_token {
+                continue;
             }
 
-            // Verify the token in the proof matches
-            if !token.is_empty() {
-                let proof_token: Address = token.parse()
-                    .map_err(|e| anyhow::anyhow!("invalid token address in proof: {e}"))?;
-                if log_addr != proof_token {
-                    continue;
-                }
-            }
-
-            // data = amount (uint256)
+            // data = amount (uint256). Cap at u64::MAX (safe — only inflates,
+            // never deflates, so an attacker can't underpay this way).
             let value = alloy::primitives::U256::from_be_slice(log.data().data.as_ref());
             found_amount = value.try_into().unwrap_or(u64::MAX);
             found = true;
@@ -232,12 +241,14 @@ impl PaymentProvider for DirectProvider {
 
         if !found {
             anyhow::bail!(
-                "tx {tx_hash} has no ERC-20 Transfer to operator {} with matching token",
-                self.operator_address
+                "tx {tx_hash} has no ERC-20 Transfer to operator {} with token {}",
+                self.operator_address, self.expected_token
             );
         }
 
-        let requested: u64 = amount.parse().unwrap_or(0);
+        // ── Parse requested amount strictly — no silent 0 fallback ──
+        let requested: u64 = amount.parse()
+            .map_err(|e| anyhow::anyhow!("invalid amount in proof: {e}"))?;
         if found_amount < requested {
             anyhow::bail!(
                 "transferred amount ({found_amount}) is less than requested ({requested})"
@@ -330,11 +341,19 @@ pub fn create_provider(
     match mode {
         PaymentMode::None => Ok(Box::new(NoopProvider::new(tangle.operator_key.clone())?)),
         PaymentMode::Shielded => Ok(Box::new(ShieldedProvider::new(tangle, billing)?)),
-        PaymentMode::Direct => Ok(Box::new(DirectProvider::new(
-            tangle.rpc_url.clone(),
-            tangle.operator_key.clone(),
-            billing.payment_token_address.clone(),
-            1, // min confirmations
-        )?)),
+        PaymentMode::Direct => {
+            if billing.payment_token_address.is_none() {
+                anyhow::bail!(
+                    "payment_mode=direct requires payment_token_address in billing config — \
+                     without it, attackers can pay with worthless tokens"
+                );
+            }
+            Ok(Box::new(DirectProvider::new(
+                tangle.rpc_url.clone(),
+                tangle.operator_key.clone(),
+                billing.payment_token_address.clone(),
+                1, // min confirmations
+            )?))
+        }
     }
 }
