@@ -1,0 +1,8 @@
+{
+  "mode": "evolve",
+  "generation": 1,
+  "activePursuit": null,
+  "status": "converged",
+  "note": "Gen 1 shipped: PaymentProvider trait wired through AppState + generic payment_gate/settle_payment. 47 tests, 4 CRITICAL/HIGH security fixes from harden, 5 Anvil E2E. Remaining: settlement retry loop, AccountGuard channel fix (Gen 2 candidates).",
+  "updatedAt": "2026-04-16T06:00:00Z"
+}
