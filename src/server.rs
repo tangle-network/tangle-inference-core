@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 use crate::billing::BillingClient;
 use crate::config::{BillingConfig, ServerConfig, TangleConfig};
-use crate::payment::{PaymentProvider, PaymentProof, create_provider};
+use crate::payment::{create_provider, PaymentProof, PaymentProvider};
 use crate::settlement_queue::{FailedSettlement, SettlementRecoveryQueue};
 
 // x402 header constants
@@ -378,8 +378,10 @@ impl AppStateBuilder {
                     Err(_) => {
                         // If provider creation fails (e.g. Direct without token),
                         // fall back to a ShieldedProvider wrapping the billing client.
-                        Arc::new(crate::payment::ShieldedProvider::new(&tangle_config, &billing_config)?)
-                            as Arc<dyn PaymentProvider>
+                        Arc::new(crate::payment::ShieldedProvider::new(
+                            &tangle_config,
+                            &billing_config,
+                        )?) as Arc<dyn PaymentProvider>
                     }
                 }
             }

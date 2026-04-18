@@ -46,11 +46,7 @@ pub trait PaymentProvider: Send + Sync + 'static {
 
     /// Settle payment after inference is served.
     /// `actual_cost` may be less than the authorized amount.
-    async fn settle(
-        &self,
-        proof: &PaymentProof,
-        actual_cost: u64,
-    ) -> anyhow::Result<()>;
+    async fn settle(&self, proof: &PaymentProof, actual_cost: u64) -> anyhow::Result<()>;
 
     /// Operator's on-chain address.
     fn operator_address(&self) -> Address;
@@ -80,18 +76,17 @@ impl ShieldedProvider {
 impl PaymentProvider for ShieldedProvider {
     async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
         let PaymentProof::SpendAuth(spend_auth) = proof else {
-            anyhow::bail!("ShieldedProvider requires SpendAuth proof, got {:?}", std::mem::discriminant(proof));
+            anyhow::bail!(
+                "ShieldedProvider requires SpendAuth proof, got {:?}",
+                std::mem::discriminant(proof)
+            );
         };
         let amount: u64 = spend_auth.amount.parse()?;
         self.client.authorize_spend(spend_auth).await?;
         Ok(amount)
     }
 
-    async fn settle(
-        &self,
-        proof: &PaymentProof,
-        actual_cost: u64,
-    ) -> anyhow::Result<()> {
+    async fn settle(&self, proof: &PaymentProof, actual_cost: u64) -> anyhow::Result<()> {
         let PaymentProof::SpendAuth(spend_auth) = proof else {
             anyhow::bail!("ShieldedProvider requires SpendAuth proof for settlement");
         };
@@ -159,8 +154,17 @@ impl DirectProvider {
 #[async_trait]
 impl PaymentProvider for DirectProvider {
     async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
-        let PaymentProof::DirectTransfer { tx_hash, from, amount, token: _ } = proof else {
-            anyhow::bail!("DirectProvider requires DirectTransfer proof, got {:?}", std::mem::discriminant(proof));
+        let PaymentProof::DirectTransfer {
+            tx_hash,
+            from,
+            amount,
+            token: _,
+        } = proof
+        else {
+            anyhow::bail!(
+                "DirectProvider requires DirectTransfer proof, got {:?}",
+                std::mem::discriminant(proof)
+            );
         };
 
         // ── Replay protection: each tx_hash can only authorize ONE request ──
@@ -177,7 +181,8 @@ impl PaymentProvider for DirectProvider {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.clone());
 
         // Parse tx hash
-        let hash: alloy::primitives::B256 = tx_hash.parse()
+        let hash: alloy::primitives::B256 = tx_hash
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid tx_hash: {e}"))?;
 
         // Get receipt
@@ -187,8 +192,9 @@ impl PaymentProvider for DirectProvider {
             .ok_or_else(|| anyhow::anyhow!("tx {tx_hash} not found — not yet confirmed?"))?;
 
         // ── Require block_number (reject pending/unconfirmed txs) ──
-        let block_number = receipt.block_number
-            .ok_or_else(|| anyhow::anyhow!("tx {tx_hash} has no block number — pending or unconfirmed"))?;
+        let block_number = receipt.block_number.ok_or_else(|| {
+            anyhow::anyhow!("tx {tx_hash} has no block number — pending or unconfirmed")
+        })?;
 
         if self.min_confirmations > 0 {
             let current_block = provider.get_block_number().await?;
@@ -259,12 +265,14 @@ impl PaymentProvider for DirectProvider {
         if !found {
             anyhow::bail!(
                 "tx {tx_hash} has no ERC-20 Transfer to operator {} with token {}",
-                self.operator_address, self.expected_token
+                self.operator_address,
+                self.expected_token
             );
         }
 
         // ── Parse requested amount strictly — no silent 0 fallback ──
-        let requested: u64 = amount.parse()
+        let requested: u64 = amount
+            .parse()
             .map_err(|e| anyhow::anyhow!("invalid amount in proof: {e}"))?;
         if found_amount < requested {
             anyhow::bail!(
@@ -272,20 +280,12 @@ impl PaymentProvider for DirectProvider {
             );
         }
 
-        tracing::info!(
-            tx_hash,
-            amount = found_amount,
-            "direct payment verified"
-        );
+        tracing::info!(tx_hash, amount = found_amount, "direct payment verified");
 
         Ok(found_amount)
     }
 
-    async fn settle(
-        &self,
-        _proof: &PaymentProof,
-        _actual_cost: u64,
-    ) -> anyhow::Result<()> {
+    async fn settle(&self, _proof: &PaymentProof, _actual_cost: u64) -> anyhow::Result<()> {
         // No-op: payment already transferred directly to operator.
         // If actual_cost < authorized amount, the operator keeps the excess
         // (same as any prepaid model). Could add refund logic later.

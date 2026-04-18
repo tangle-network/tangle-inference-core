@@ -85,7 +85,11 @@ impl SettlementRecoveryQueue {
             .filter_map(|e| serde_json::to_string(e).ok())
             .collect::<Vec<_>>()
             .join("\n");
-        let content = if content.is_empty() { String::new() } else { content + "\n" };
+        let content = if content.is_empty() {
+            String::new()
+        } else {
+            content + "\n"
+        };
 
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -221,14 +225,24 @@ mod tests {
         let queue = SettlementRecoveryQueue::new(dir.path().join("dlq.jsonl"));
 
         queue.enqueue(FailedSettlement {
-            commitment: "0x1".into(), nonce: 1, amount: "100".into(),
-            operator: "0xop".into(), service_id: 1, timestamp: 0,
-            error: "err".into(), retry_count: 0,
+            commitment: "0x1".into(),
+            nonce: 1,
+            amount: "100".into(),
+            operator: "0xop".into(),
+            service_id: 1,
+            timestamp: 0,
+            error: "err".into(),
+            retry_count: 0,
         });
         queue.enqueue(FailedSettlement {
-            commitment: "0x2".into(), nonce: 2, amount: "200".into(),
-            operator: "0xop".into(), service_id: 1, timestamp: 0,
-            error: "err".into(), retry_count: 0,
+            commitment: "0x2".into(),
+            nonce: 2,
+            amount: "200".into(),
+            operator: "0xop".into(),
+            service_id: 1,
+            timestamp: 0,
+            error: "err".into(),
+            retry_count: 0,
         });
         assert_eq!(queue.depth(), 2);
 
@@ -247,33 +261,50 @@ mod tests {
 
         // Entry 1: will succeed on retry
         queue.enqueue(FailedSettlement {
-            commitment: "0xsuccess".into(), nonce: 1, amount: "100".into(),
-            operator: "0xop".into(), service_id: 1, timestamp: 0,
-            error: "gas".into(), retry_count: 0,
+            commitment: "0xsuccess".into(),
+            nonce: 1,
+            amount: "100".into(),
+            operator: "0xop".into(),
+            service_id: 1,
+            timestamp: 0,
+            error: "gas".into(),
+            retry_count: 0,
         });
         // Entry 2: will fail on retry
         queue.enqueue(FailedSettlement {
-            commitment: "0xfail".into(), nonce: 2, amount: "200".into(),
-            operator: "0xop".into(), service_id: 1, timestamp: 0,
-            error: "rpc".into(), retry_count: 0,
+            commitment: "0xfail".into(),
+            nonce: 2,
+            amount: "200".into(),
+            operator: "0xop".into(),
+            service_id: 1,
+            timestamp: 0,
+            error: "rpc".into(),
+            retry_count: 0,
         });
         // Entry 3: past max retries — permanently failed
         queue.enqueue(FailedSettlement {
-            commitment: "0xperm".into(), nonce: 3, amount: "300".into(),
-            operator: "0xop".into(), service_id: 1, timestamp: 0,
-            error: "repeated".into(), retry_count: MAX_RETRY_COUNT,
+            commitment: "0xperm".into(),
+            nonce: 3,
+            amount: "300".into(),
+            operator: "0xop".into(),
+            service_id: 1,
+            timestamp: 0,
+            error: "repeated".into(),
+            retry_count: MAX_RETRY_COUNT,
         });
 
-        let (succeeded, failed, perm) = queue.retry_all(|entry| {
-            let is_success = entry.commitment == "0xsuccess";
-            async move {
-                if is_success {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("still failing"))
+        let (succeeded, failed, perm) = queue
+            .retry_all(|entry| {
+                let is_success = entry.commitment == "0xsuccess";
+                async move {
+                    if is_success {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("still failing"))
+                    }
                 }
-            }
-        }).await;
+            })
+            .await;
 
         assert_eq!(succeeded, 1);
         assert_eq!(failed, 1);

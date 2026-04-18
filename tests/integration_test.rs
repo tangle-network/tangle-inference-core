@@ -730,7 +730,7 @@ fn test_spend_auth_payload() -> SpendAuthPayload {
         amount: "100000".into(),
         operator: format!("{}", test_operator_signer().address()),
         nonce: 1,
-        expiry: u64::MAX, // far future
+        expiry: u64::MAX,                               // far future
         signature: "0x".to_string() + &"00".repeat(65), // dummy sig — won't verify on-chain but sufficient for type tests
     }
 }
@@ -770,9 +770,15 @@ async fn shielded_provider_rejects_direct_transfer_proof() {
         token: "0x0".into(),
     };
     let result = provider.authorize(&proof).await;
-    assert!(result.is_err(), "ShieldedProvider must reject DirectTransfer proof");
+    assert!(
+        result.is_err(),
+        "ShieldedProvider must reject DirectTransfer proof"
+    );
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("SpendAuth"), "error should mention SpendAuth, got: {err}");
+    assert!(
+        err.contains("SpendAuth"),
+        "error should mention SpendAuth, got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -795,10 +801,16 @@ fn payment_proof_serde_round_trip_spend_auth() {
     let payload = test_spend_auth_payload();
     let proof = PaymentProof::SpendAuth(payload);
     let json = serde_json::to_string(&proof).unwrap();
-    assert!(json.contains("\"type\":\"spend_auth\""), "tag should be spend_auth");
+    assert!(
+        json.contains("\"type\":\"spend_auth\""),
+        "tag should be spend_auth"
+    );
     let parsed: PaymentProof = serde_json::from_str(&json).unwrap();
     match parsed {
-        PaymentProof::SpendAuth(p) => assert_eq!(p.commitment, "0x0000000000000000000000000000000000000000000000000000000000000001"),
+        PaymentProof::SpendAuth(p) => assert_eq!(
+            p.commitment,
+            "0x0000000000000000000000000000000000000000000000000000000000000001"
+        ),
         _ => panic!("expected SpendAuth variant"),
     }
 }
@@ -815,7 +827,9 @@ fn payment_proof_serde_round_trip_direct_transfer() {
     assert!(json.contains("\"type\":\"direct_transfer\""));
     let parsed: PaymentProof = serde_json::from_str(&json).unwrap();
     match parsed {
-        PaymentProof::DirectTransfer { tx_hash, amount, .. } => {
+        PaymentProof::DirectTransfer {
+            tx_hash, amount, ..
+        } => {
             assert_eq!(tx_hash, "0xdeadbeef");
             assert_eq!(amount, "1000000");
         }
@@ -827,14 +841,20 @@ fn payment_proof_serde_round_trip_direct_transfer() {
 fn payment_proof_rejects_unknown_type_tag() {
     let json = r#"{"type":"bitcoin","tx_hash":"abc"}"#;
     let result = serde_json::from_str::<PaymentProof>(json);
-    assert!(result.is_err(), "unknown payment type should fail deserialization");
+    assert!(
+        result.is_err(),
+        "unknown payment type should fail deserialization"
+    );
 }
 
 #[test]
 fn payment_proof_rejects_missing_type_tag() {
     let json = r#"{"tx_hash":"0xabc","amount":"100"}"#;
     let result = serde_json::from_str::<PaymentProof>(json);
-    assert!(result.is_err(), "missing type tag should fail deserialization");
+    assert!(
+        result.is_err(),
+        "missing type tag should fail deserialization"
+    );
 }
 
 #[test]
@@ -861,7 +881,8 @@ fn create_provider_direct_mode_requires_token() {
     assert!(provider.is_err(), "direct mode without token must fail");
 
     let mut billing_with_token = test_billing_config();
-    billing_with_token.payment_token_address = Some("0x0000000000000000000000000000000000000001".into());
+    billing_with_token.payment_token_address =
+        Some("0x0000000000000000000000000000000000000001".into());
     let provider = create_provider(PaymentMode::Direct, &tangle, &billing_with_token);
     assert!(provider.is_ok());
 }
@@ -913,11 +934,11 @@ fn noop_provider_rejects_invalid_key() {
 /// For test simplicity: we use alloy's sol! macro to deploy inline.
 mod anvil_e2e {
     use super::*;
+    use alloy::network::EthereumWallet;
+    use alloy::providers::ProviderBuilder;
+    use alloy::sol;
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
-    use alloy::providers::ProviderBuilder;
-    use alloy::network::EthereumWallet;
-    use alloy::sol;
     use tangle_inference_core::payment::{DirectProvider, PaymentProof, PaymentProvider};
 
     // Minimal ERC-20 compiled from tests/TestERC20.sol with solc --optimize
@@ -996,7 +1017,14 @@ mod anvil_e2e {
         let caller_signer: PrivateKeySigner = CALLER_KEY.parse().unwrap();
         let caller_addr = caller_signer.address();
         let mint_amount = U256::from(1_000_000u64);
-        token.mint(caller_addr, mint_amount).send().await.unwrap().get_receipt().await.unwrap();
+        token
+            .mint(caller_addr, mint_amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
 
         // Verify balance
         let bal = token.balanceOf(caller_addr).call().await.unwrap();
@@ -1013,8 +1041,12 @@ mod anvil_e2e {
         let operator_addr = deployer_signer.address();
         let tx_receipt = caller_token
             .transfer(operator_addr, transfer_amount)
-            .send().await.unwrap()
-            .get_receipt().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
 
         let tx_hash = format!("{:#x}", tx_receipt.transaction_hash);
 
@@ -1024,7 +1056,8 @@ mod anvil_e2e {
             TEST_OPERATOR_KEY.into(),
             Some(format!("{:#x}", token_addr)),
             0, // 0 confirmations for test (anvil auto-mines)
-        ).unwrap();
+        )
+        .unwrap();
 
         let proof = PaymentProof::DirectTransfer {
             tx_hash: tx_hash.clone(),
@@ -1034,7 +1067,11 @@ mod anvil_e2e {
         };
 
         let authorized = provider.authorize(&proof).await;
-        assert!(authorized.is_ok(), "authorize failed: {:?}", authorized.err());
+        assert!(
+            authorized.is_ok(),
+            "authorize failed: {:?}",
+            authorized.err()
+        );
         assert_eq!(authorized.unwrap(), 500_000);
 
         // Settle should be a no-op
@@ -1063,7 +1100,14 @@ mod anvil_e2e {
 
         let caller_signer: PrivateKeySigner = CALLER_KEY.parse().unwrap();
         let caller_addr = caller_signer.address();
-        token.mint(caller_addr, U256::from(1000u64)).send().await.unwrap().get_receipt().await.unwrap();
+        token
+            .mint(caller_addr, U256::from(1000u64))
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
 
         let caller_wallet = EthereumWallet::from(caller_signer);
         let caller_provider = ProviderBuilder::new()
@@ -1074,12 +1118,20 @@ mod anvil_e2e {
         // Transfer only 100 tokens
         let tx_receipt = caller_token
             .transfer(deployer_signer.address(), U256::from(100u64))
-            .send().await.unwrap()
-            .get_receipt().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
 
         let provider = DirectProvider::new(
-            rpc, TEST_OPERATOR_KEY.into(), Some(format!("{:#x}", token_addr)), 0,
-        ).unwrap();
+            rpc,
+            TEST_OPERATOR_KEY.into(),
+            Some(format!("{:#x}", token_addr)),
+            0,
+        )
+        .unwrap();
 
         // Claim 500 but only transferred 100 — should reject
         let proof = PaymentProof::DirectTransfer {
@@ -1091,7 +1143,10 @@ mod anvil_e2e {
 
         let result = provider.authorize(&proof).await;
         assert!(result.is_err(), "should reject insufficient amount");
-        assert!(result.unwrap_err().to_string().contains("less than requested"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("less than requested"));
     }
 
     #[tokio::test]
@@ -1115,10 +1170,19 @@ mod anvil_e2e {
 
         let caller_signer: PrivateKeySigner = CALLER_KEY.parse().unwrap();
         let caller_addr = caller_signer.address();
-        token.mint(caller_addr, U256::from(1000u64)).send().await.unwrap().get_receipt().await.unwrap();
+        token
+            .mint(caller_addr, U256::from(1000u64))
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
 
         // Transfer to a RANDOM address, not the operator
-        let random_recipient: Address = "0x000000000000000000000000000000000000dEaD".parse().unwrap();
+        let random_recipient: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
         let caller_wallet = EthereumWallet::from(caller_signer);
         let caller_provider = ProviderBuilder::new()
             .wallet(caller_wallet)
@@ -1127,13 +1191,21 @@ mod anvil_e2e {
 
         let tx_receipt = caller_token
             .transfer(random_recipient, U256::from(500u64))
-            .send().await.unwrap()
-            .get_receipt().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
 
         // Operator's DirectProvider should reject — transfer wasn't to them
         let provider = DirectProvider::new(
-            rpc, TEST_OPERATOR_KEY.into(), Some(format!("{:#x}", token_addr)), 0,
-        ).unwrap();
+            rpc,
+            TEST_OPERATOR_KEY.into(),
+            Some(format!("{:#x}", token_addr)),
+            0,
+        )
+        .unwrap();
 
         let proof = PaymentProof::DirectTransfer {
             tx_hash: format!("{:#x}", tx_receipt.transaction_hash),
@@ -1144,7 +1216,10 @@ mod anvil_e2e {
 
         let result = provider.authorize(&proof).await;
         assert!(result.is_err(), "should reject transfer to wrong recipient");
-        assert!(result.unwrap_err().to_string().contains("no ERC-20 Transfer to operator"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no ERC-20 Transfer to operator"));
     }
 
     #[tokio::test]
@@ -1168,7 +1243,14 @@ mod anvil_e2e {
 
         let caller_signer: PrivateKeySigner = CALLER_KEY.parse().unwrap();
         let caller_addr = caller_signer.address();
-        token.mint(caller_addr, U256::from(10_000u64)).send().await.unwrap().get_receipt().await.unwrap();
+        token
+            .mint(caller_addr, U256::from(10_000u64))
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
 
         let caller_wallet = EthereumWallet::from(caller_signer);
         let caller_provider = ProviderBuilder::new()
@@ -1178,14 +1260,22 @@ mod anvil_e2e {
 
         let tx_receipt = caller_token
             .transfer(deployer_signer.address(), U256::from(5_000u64))
-            .send().await.unwrap()
-            .get_receipt().await.unwrap();
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
 
         let tx_hash = format!("{:#x}", tx_receipt.transaction_hash);
 
         let provider = DirectProvider::new(
-            rpc, TEST_OPERATOR_KEY.into(), Some(format!("{:#x}", token_addr)), 0,
-        ).unwrap();
+            rpc,
+            TEST_OPERATOR_KEY.into(),
+            Some(format!("{:#x}", token_addr)),
+            0,
+        )
+        .unwrap();
 
         let proof = PaymentProof::DirectTransfer {
             tx_hash: tx_hash.clone(),
@@ -1201,7 +1291,10 @@ mod anvil_e2e {
         // Second use: MUST be rejected (replay)
         let second = provider.authorize(&proof).await;
         assert!(second.is_err(), "CRITICAL: tx_hash replay must be rejected");
-        assert!(second.unwrap_err().to_string().contains("replay"), "error should mention replay");
+        assert!(
+            second.unwrap_err().to_string().contains("replay"),
+            "error should mention replay"
+        );
     }
 
     #[tokio::test]
@@ -1213,9 +1306,12 @@ mod anvil_e2e {
 
         let anvil = AnvilInstance::spawn();
         let provider = DirectProvider::new(
-            anvil.rpc_url(), TEST_OPERATOR_KEY.into(),
-            Some("0x0000000000000000000000000000000000000001".into()), 0,
-        ).unwrap();
+            anvil.rpc_url(),
+            TEST_OPERATOR_KEY.into(),
+            Some("0x0000000000000000000000000000000000000001".into()),
+            0,
+        )
+        .unwrap();
 
         let proof = PaymentProof::DirectTransfer {
             tx_hash: "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
@@ -1241,9 +1337,15 @@ fn direct_provider_rejects_missing_token() {
         None, // no token = must fail
         1,
     );
-    assert!(result.is_err(), "DirectProvider MUST require a payment token");
+    assert!(
+        result.is_err(),
+        "DirectProvider MUST require a payment token"
+    );
     let err = format!("{}", result.err().unwrap());
-    assert!(err.contains("requires payment_token"), "error should mention token requirement, got: {err}");
+    assert!(
+        err.contains("requires payment_token"),
+        "error should mention token requirement, got: {err}"
+    );
 }
 
 #[test]

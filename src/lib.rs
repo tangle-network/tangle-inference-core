@@ -4,10 +4,10 @@ pub mod settlement_queue;
 
 #[cfg(feature = "billing")]
 pub mod billing;
-#[cfg(feature = "billing")]
-pub mod payment;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+#[cfg(feature = "billing")]
+pub mod payment;
 #[cfg(all(feature = "http", feature = "billing"))]
 pub mod server;
 
@@ -18,13 +18,13 @@ pub use billing::{
     FlatRequestCostModel, PerCharCostModel, PerImageCostModel, PerSecondCostModel,
     PerTokenCostModel, TaskTypeCostModel,
 };
+#[cfg(feature = "metrics")]
+pub use metrics::{gather, health_summary, on_chain_metrics, RequestGuard};
 #[cfg(feature = "billing")]
 pub use payment::{
     create_provider, DirectProvider, NoopProvider, PaymentMode, PaymentProof, PaymentProvider,
     ShieldedProvider,
 };
-#[cfg(feature = "metrics")]
-pub use metrics::{gather, health_summary, on_chain_metrics, RequestGuard};
 #[cfg(all(feature = "http", feature = "billing"))]
 pub use server::{
     acquire_permit, billing_gate, error_response, extract_x402_spend_auth, gpu_health_handler,
