@@ -51,7 +51,7 @@ fn test_tangle_config() -> TangleConfig {
 
 fn test_billing_config() -> BillingConfig {
     BillingConfig {
-        payment_mode: tangle_inference_core::PaymentMode::Shielded,
+        payment_rails: tangle_inference_core::PaymentRails::SHIELDED,
         billing_required: true,
         max_spend_per_request: 1_000_000,
         min_credit_balance: 1_000,
@@ -713,7 +713,7 @@ async fn app_state_from_config_constructs_correctly() {
 // - create_provider factory with each mode
 
 use tangle_inference_core::payment::{
-    create_provider, NoopProvider, PaymentMode, PaymentProof, PaymentProvider, ShieldedProvider,
+    create_provider, NoopProvider, PaymentProof, PaymentProvider, PaymentRails, PaymentRouter, ShieldedProvider,
 };
 
 /// Anvil default account #0 private key.
@@ -862,7 +862,7 @@ fn payment_proof_rejects_missing_type_tag() {
 fn create_provider_noop_mode() {
     let tangle = test_tangle_config();
     let billing = test_billing_config();
-    let provider = create_provider(PaymentMode::None, &tangle, &billing);
+    let provider = create_provider(PaymentRails::NONE, &tangle, &billing);
     assert!(provider.is_ok());
 }
 
@@ -870,7 +870,7 @@ fn create_provider_noop_mode() {
 fn create_provider_shielded_mode() {
     let tangle = test_tangle_config();
     let billing = test_billing_config();
-    let provider = create_provider(PaymentMode::Shielded, &tangle, &billing);
+    let provider = create_provider(PaymentRails::SHIELDED, &tangle, &billing);
     assert!(provider.is_ok());
 }
 
@@ -878,35 +878,61 @@ fn create_provider_shielded_mode() {
 fn create_provider_direct_mode_requires_token() {
     let tangle = test_tangle_config();
     let billing = test_billing_config(); // no payment_token_address
-    let provider = create_provider(PaymentMode::Direct, &tangle, &billing);
+    let provider = create_provider(PaymentRails::DIRECT, &tangle, &billing);
     assert!(provider.is_err(), "direct mode without token must fail");
 
     let mut billing_with_token = test_billing_config();
     billing_with_token.payment_token_address =
         Some("0x0000000000000000000000000000000000000001".into());
-    let provider = create_provider(PaymentMode::Direct, &tangle, &billing_with_token);
+    let provider = create_provider(PaymentRails::DIRECT, &tangle, &billing_with_token);
     assert!(provider.is_ok());
 }
 
 #[test]
-fn payment_mode_default_is_shielded() {
-    let mode: PaymentMode = serde_json::from_str(r#""shielded""#).unwrap();
-    assert_eq!(mode, PaymentMode::Shielded);
-    assert_eq!(PaymentMode::default(), PaymentMode::Shielded);
+fn payment_rails_default_is_shielded_only() {
+    assert_eq!(PaymentRails::default(), PaymentRails::SHIELDED);
+    let only_direct: PaymentRails = serde_json::from_str(r#"{"direct":true}"#).unwrap();
+    assert_eq!(only_direct, PaymentRails::DIRECT);
+    assert!(!only_direct.shielded && only_direct.direct);
 }
 
 #[test]
-fn payment_mode_serde_all_variants() {
-    for (json, expected) in [
-        (r#""none""#, PaymentMode::None),
-        (r#""shielded""#, PaymentMode::Shielded),
-        (r#""direct""#, PaymentMode::Direct),
-    ] {
-        let parsed: PaymentMode = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed, expected);
-        let back = serde_json::to_string(&parsed).unwrap();
-        assert_eq!(back, json);
-    }
+fn payment_rails_compose_freely() {
+    let both: PaymentRails = serde_json::from_str(r#"{"shielded":true,"direct":true}"#).unwrap();
+    assert_eq!(both, PaymentRails::BOTH);
+    assert!(PaymentRails::NONE.is_empty());
+    assert!(!PaymentRails::BOTH.is_empty());
+}
+
+#[test]
+fn create_provider_both_rails() {
+    let tangle = test_tangle_config();
+    let mut billing = test_billing_config();
+    billing.payment_token_address = Some("0x0000000000000000000000000000000000000001".into());
+    assert!(
+        create_provider(PaymentRails::BOTH, &tangle, &billing).is_ok(),
+        "both rails should build when a token is pinned"
+    );
+}
+
+#[tokio::test]
+async fn router_rejects_proof_for_disabled_rail() {
+    // A shielded-only router must reject a DirectTransfer proof up front —
+    // without touching the chain — rather than silently serving.
+    let tangle = test_tangle_config();
+    let billing = test_billing_config();
+    let router = PaymentRouter::build(PaymentRails::SHIELDED, &tangle, &billing).unwrap();
+    let direct = PaymentProof::DirectTransfer {
+        tx_hash: "0x00".into(),
+        from: "0x00".into(),
+        amount: "1".into(),
+        token: "0x01".into(),
+    };
+    let err = router.authorize(&direct).await.unwrap_err();
+    assert!(
+        err.to_string().contains("direct rail not enabled"),
+        "expected disabled-rail rejection, got: {err}"
+    );
 }
 
 #[test]

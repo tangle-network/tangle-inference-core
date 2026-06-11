@@ -75,35 +75,49 @@ pub struct ServerConfig {
     pub max_per_account_requests: usize,
 }
 
-/// Payment mode — which payment provider to use.
+/// The payment rails an operator accepts on its billable surfaces.
+///
+/// A request is served when it carries a valid proof for an ENABLED rail; an
+/// empty set is an open (unbilled) endpoint. Rails compose freely — enabling
+/// several lets one endpoint take any of them, dispatched per request by proof
+/// type (see [`crate::payment::PaymentRouter`]). Adding a new rail is one more
+/// flag here plus a `PaymentProvider` impl — never an enum cross-product.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PaymentMode {
-    /// No billing — open endpoint.
-    None,
-    /// ShieldedCredits (default, backward compatible).
-    Shielded,
-    /// Direct ERC-20 transfer verification.
-    Direct,
-    /// Accept BOTH rails on the same endpoint, dispatched per request by the
-    /// payment-proof type: a `SpendAuth` proof settles shielded, a
-    /// `DirectTransfer` proof settles in plain ERC-20. Requires both a shielded
-    /// config and a pinned `payment_token_address`.
-    Both,
+pub struct PaymentRails {
+    /// ShieldedCredits SpendAuth — private, prepaid shielded-pool balance.
+    #[serde(default)]
+    pub shielded: bool,
+    /// Direct ERC-20 transfer — plain USDC, pay-per-call (needs a pinned
+    /// `payment_token_address`).
+    #[serde(default)]
+    pub direct: bool,
 }
 
-impl Default for PaymentMode {
+impl PaymentRails {
+    pub const NONE: Self = Self { shielded: false, direct: false };
+    pub const SHIELDED: Self = Self { shielded: true, direct: false };
+    pub const DIRECT: Self = Self { shielded: false, direct: true };
+    pub const BOTH: Self = Self { shielded: true, direct: true };
+
+    /// No rail enabled → open, unbilled endpoint.
+    pub fn is_empty(&self) -> bool {
+        !self.shielded && !self.direct
+    }
+}
+
+impl Default for PaymentRails {
     fn default() -> Self {
-        Self::Shielded
+        Self::SHIELDED
     }
 }
 
 /// Billing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BillingConfig {
-    /// Payment mode: "none", "shielded" (default), or "direct".
+    /// Which payment rails this operator accepts. Default: shielded only.
+    /// e.g. `{ shielded = true, direct = true }` to take both.
     #[serde(default)]
-    pub payment_mode: PaymentMode,
+    pub payment_rails: PaymentRails,
 
     /// Whether billing (spend_auth / direct transfer) is required on every request.
     #[serde(default = "default_billing_required")]

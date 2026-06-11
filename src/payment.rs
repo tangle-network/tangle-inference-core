@@ -437,54 +437,94 @@ impl PaymentProvider for NoopProvider {
     }
 }
 
-// ─── CompositeProvider ────────────────────────────────────────────────
+// ─── PaymentRouter ────────────────────────────────────────────────────
 
-/// Accept BOTH rails on one endpoint, dispatched by the proof type: a
-/// `SpendAuth` proof routes to the shielded provider, a `DirectTransfer` proof
-/// to the direct provider. `operator_address` is the same key for both, so a
-/// claim/transfer lands in the same place regardless of how the buyer paid.
-pub struct CompositeProvider {
-    shielded: ShieldedProvider,
-    direct: DirectProvider,
+pub use crate::config::PaymentRails;
+
+/// The universal payment provider: holds the operator's enabled rails and
+/// dispatches each request to the matching one by proof type. Enabling several
+/// rails lets one endpoint accept any of them; a proof for a disabled rail is
+/// rejected. Every rail derives its payout from the same operator key, so funds
+/// land in the same place regardless of how the buyer paid.
+///
+/// This is the single, extensible composition point — adding a rail is a new
+/// `Option<NewProvider>` field plus a match arm, never an enum cross-product.
+pub struct PaymentRouter {
+    shielded: Option<ShieldedProvider>,
+    direct: Option<DirectProvider>,
+    operator_address: Address,
 }
 
-impl CompositeProvider {
-    pub fn new(shielded: ShieldedProvider, direct: DirectProvider) -> Self {
-        Self { shielded, direct }
+impl PaymentRouter {
+    pub fn build(
+        rails: PaymentRails,
+        tangle: &TangleConfig,
+        billing: &BillingConfig,
+    ) -> anyhow::Result<Self> {
+        use alloy::signers::local::PrivateKeySigner;
+        let operator_address = tangle.operator_key.parse::<PrivateKeySigner>()?.address();
+        Ok(Self {
+            shielded: rails
+                .shielded
+                .then(|| ShieldedProvider::new(tangle, billing))
+                .transpose()?,
+            direct: rails.direct.then(|| build_direct(tangle, billing)).transpose()?,
+            operator_address,
+        })
     }
 }
 
 #[async_trait]
-impl PaymentProvider for CompositeProvider {
+impl PaymentProvider for PaymentRouter {
     async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
         match proof {
-            PaymentProof::SpendAuth(_) => self.shielded.authorize(proof).await,
-            PaymentProof::DirectTransfer { .. } => self.direct.authorize(proof).await,
+            PaymentProof::SpendAuth(_) => {
+                self.shielded
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("shielded rail not enabled on this operator"))?
+                    .authorize(proof)
+                    .await
+            }
+            PaymentProof::DirectTransfer { .. } => {
+                self.direct
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("direct rail not enabled on this operator"))?
+                    .authorize(proof)
+                    .await
+            }
         }
     }
 
     async fn settle(&self, proof: &PaymentProof, actual_cost: u64) -> anyhow::Result<()> {
         match proof {
-            PaymentProof::SpendAuth(_) => self.shielded.settle(proof, actual_cost).await,
-            PaymentProof::DirectTransfer { .. } => self.direct.settle(proof, actual_cost).await,
+            PaymentProof::SpendAuth(_) => {
+                self.shielded
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("shielded rail not enabled on this operator"))?
+                    .settle(proof, actual_cost)
+                    .await
+            }
+            PaymentProof::DirectTransfer { .. } => {
+                self.direct
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("direct rail not enabled on this operator"))?
+                    .settle(proof, actual_cost)
+                    .await
+            }
         }
     }
 
     fn operator_address(&self) -> Address {
-        // Both providers derive from the same operator key.
-        self.shielded.operator_address()
+        self.operator_address
     }
 }
 
 // ─── Factory ──────────────────────────────────────────────────────────
 
-// Re-export PaymentMode from config so consumers can import from payment module
-pub use crate::config::PaymentMode;
-
 fn build_direct(tangle: &TangleConfig, billing: &BillingConfig) -> anyhow::Result<DirectProvider> {
     if billing.payment_token_address.is_none() {
         anyhow::bail!(
-            "direct payment requires payment_token_address in billing config — \
+            "direct rail requires payment_token_address in billing config — \
              without it, attackers can pay with worthless tokens"
         );
     }
@@ -497,20 +537,17 @@ fn build_direct(tangle: &TangleConfig, billing: &BillingConfig) -> anyhow::Resul
     )
 }
 
-/// Create a payment provider from config.
+/// Build the operator's payment provider for the rails it accepts. An empty rail
+/// set is an open (unbilled) endpoint.
 pub fn create_provider(
-    mode: PaymentMode,
+    rails: PaymentRails,
     tangle: &TangleConfig,
     billing: &BillingConfig,
 ) -> anyhow::Result<Box<dyn PaymentProvider>> {
-    match mode {
-        PaymentMode::None => Ok(Box::new(NoopProvider::new(tangle.operator_key.clone())?)),
-        PaymentMode::Shielded => Ok(Box::new(ShieldedProvider::new(tangle, billing)?)),
-        PaymentMode::Direct => Ok(Box::new(build_direct(tangle, billing)?)),
-        PaymentMode::Both => Ok(Box::new(CompositeProvider::new(
-            ShieldedProvider::new(tangle, billing)?,
-            build_direct(tangle, billing)?,
-        ))),
+    if rails.is_empty() {
+        Ok(Box::new(NoopProvider::new(tangle.operator_key.clone())?))
+    } else {
+        Ok(Box::new(PaymentRouter::build(rails, tangle, billing)?))
     }
 }
 

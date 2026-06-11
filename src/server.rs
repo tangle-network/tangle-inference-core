@@ -244,8 +244,8 @@ impl AppState {
         let operator_address = billing_client.operator_address();
         let nonce_store = Arc::new(NonceStore::load(billing.nonce_store_path.clone()));
 
-        // Create payment provider from config's payment_mode
-        let provider = create_provider(billing.payment_mode, tangle, billing)?;
+        // Build the payment provider for the operator's enabled rails.
+        let provider = create_provider(billing.payment_rails, tangle, billing)?;
 
         AppStateBuilder::new()
             .billing(Arc::new(billing_client))
@@ -368,9 +368,8 @@ impl AppStateBuilder {
         let payment_provider = match self.payment_provider {
             Some(p) => p,
             None => {
-                // Fallback: create from config if available, or noop
-                let mode = billing_config.payment_mode;
-                match create_provider(mode, &tangle_config, &billing_config) {
+                // Fallback: build from the configured rails, or noop.
+                match create_provider(billing_config.payment_rails, &tangle_config, &billing_config) {
                     Ok(p) => {
                         let p: Arc<dyn PaymentProvider> = Arc::from(p);
                         p
