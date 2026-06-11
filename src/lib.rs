@@ -22,8 +22,8 @@ pub use billing::{
 pub use metrics::{gather, health_summary, on_chain_metrics, RequestGuard};
 #[cfg(feature = "billing")]
 pub use payment::{
-    create_provider, DirectProvider, NoopProvider, PaymentMode, PaymentProof, PaymentProvider,
-    ShieldedProvider,
+    create_provider, DirectProvider, NoopProvider, PaymentProof, PaymentProvider, PaymentRails,
+    PaymentRouter, ShieldedProvider,
 };
 #[cfg(all(feature = "http", feature = "billing"))]
 pub use server::{
