@@ -85,6 +85,11 @@ pub enum PaymentMode {
     Shielded,
     /// Direct ERC-20 transfer verification.
     Direct,
+    /// Accept BOTH rails on the same endpoint, dispatched per request by the
+    /// payment-proof type: a `SpendAuth` proof settles shielded, a
+    /// `DirectTransfer` proof settles in plain ERC-20. Requires both a shielded
+    /// config and a pinned `payment_token_address`.
+    Both,
 }
 
 impl Default for PaymentMode {
@@ -130,6 +135,13 @@ pub struct BillingConfig {
     /// Path to persist used nonces across restarts (replay protection).
     #[serde(default = "default_nonce_store_path")]
     pub nonce_store_path: Option<PathBuf>,
+
+    /// Path to persist consumed direct-transfer tx hashes across restarts.
+    /// Without it, an operator restart forgets used payment txs and the same
+    /// transfer can be replayed for unlimited free inference — the Direct
+    /// rail's analogue of `nonce_store_path`.
+    #[serde(default = "default_direct_replay_store_path")]
+    pub direct_replay_store_path: Option<PathBuf>,
 
     /// ERC-20 token address for x402 payment (e.g. USDC wrapped via VAnchor).
     #[serde(default)]
@@ -200,6 +212,10 @@ fn default_clock_skew_tolerance() -> u64 {
 
 fn default_nonce_store_path() -> Option<PathBuf> {
     Some(PathBuf::from("data/nonces.json"))
+}
+
+fn default_direct_replay_store_path() -> Option<PathBuf> {
+    Some(PathBuf::from("data/used-tx.json"))
 }
 
 #[cfg(test)]

@@ -7,6 +7,9 @@
 //!
 //! Blueprints use `PaymentProvider` trait; config selects the implementation.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use alloy::primitives::Address;
 use async_trait::async_trait;
 
@@ -98,6 +101,111 @@ impl PaymentProvider for ShieldedProvider {
     }
 }
 
+// ─── UsedTxStore ──────────────────────────────────────────────────────
+
+/// Replay protection for the Direct rail: a confirmed-consumed set of payment
+/// tx hashes, persisted across restarts, plus an ephemeral in-flight set.
+///
+/// Three properties, all required for a payment rail:
+///   1. **Persistent** — a consumed tx hash survives operator restart (the
+///      in-memory-only predecessor let a restart replay any past payment for
+///      free inference). Mirrors `NonceStore`'s persistence.
+///   2. **Concurrency-safe** — `reserve` holds the lock across check+insert, so
+///      two concurrent requests with the same tx hash cannot both pass.
+///   3. **Retry-safe** — a tx is only *committed* (persisted as consumed) after
+///      its on-chain transfer verifies; a transient RPC failure `release`s the
+///      reservation so a legitimate payer can retry. The predecessor inserted
+///      before verifying, permanently burning a tx on any transient error.
+pub struct UsedTxStore {
+    inner: tokio::sync::Mutex<UsedTxInner>,
+    path: Option<PathBuf>,
+}
+
+#[derive(Default)]
+struct UsedTxInner {
+    used: HashSet<String>,
+    in_flight: HashSet<String>,
+}
+
+impl UsedTxStore {
+    /// Load the consumed set from disk if a path is configured.
+    pub fn load(path: Option<PathBuf>) -> Self {
+        let used: HashSet<String> = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|data| serde_json::from_str::<Vec<String>>(&data).ok())
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+
+        if path.is_some() {
+            tracing::info!(count = used.len(), "loaded persisted direct-transfer tx hashes");
+        } else {
+            tracing::warn!(
+                "direct_replay_store_path not configured — used tx hashes are in-memory only. \
+                 Operator restart will allow replay of past payment transfers for free inference."
+            );
+        }
+
+        Self {
+            inner: tokio::sync::Mutex::new(UsedTxInner { used, in_flight: HashSet::new() }),
+            path,
+        }
+    }
+
+    /// Atomically reserve a tx hash for verification. Errors if it was already
+    /// consumed (replay) or is already being verified concurrently.
+    async fn reserve(&self, tx_hash: &str) -> anyhow::Result<()> {
+        let mut g = self.inner.lock().await;
+        if g.used.contains(tx_hash) {
+            anyhow::bail!("tx_hash {tx_hash} already used — replay rejected");
+        }
+        if !g.in_flight.insert(tx_hash.to_string()) {
+            anyhow::bail!("tx_hash {tx_hash} verification already in progress");
+        }
+        Ok(())
+    }
+
+    /// Commit a verified tx hash to the persistent consumed set.
+    async fn commit(&self, tx_hash: &str) {
+        let used_snapshot = {
+            let mut g = self.inner.lock().await;
+            g.in_flight.remove(tx_hash);
+            g.used.insert(tx_hash.to_string());
+            g.used.clone()
+        };
+        self.persist(&used_snapshot);
+    }
+
+    /// Release a reservation whose verification did not succeed, so a
+    /// legitimate payer can retry (e.g. after a transient RPC error).
+    async fn release(&self, tx_hash: &str) {
+        self.inner.lock().await.in_flight.remove(tx_hash);
+    }
+
+    fn persist(&self, used: &HashSet<String>) {
+        let Some(ref path) = self.path else { return };
+        let records: Vec<&String> = used.iter().collect();
+        let Ok(data) = serde_json::to_string(&records) else {
+            tracing::error!("failed to serialize direct-transfer tx store");
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &data).is_ok() {
+            if let Err(e) = std::fs::rename(&tmp, path) {
+                tracing::warn!(error = %e, "failed to persist direct-transfer tx store");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn is_used(&self, tx_hash: &str) -> bool {
+        self.inner.lock().await.used.contains(tx_hash)
+    }
+}
+
 // ─── DirectProvider ───────────────────────────────────────────────────
 
 /// Direct on-chain payment verification.
@@ -118,10 +226,9 @@ pub struct DirectProvider {
     /// Without this, an attacker deploys a worthless token and pays with it.
     expected_token: Address,
     min_confirmations: u64,
-    /// Replay protection — tracks used tx hashes. A tx_hash can only
-    /// authorize one request. Without this, one real transfer = unlimited
-    /// free inference.
-    used_tx_hashes: tokio::sync::RwLock<std::collections::HashSet<String>>,
+    /// Replay protection — persistent across restarts, retry-safe on transient
+    /// failure. A tx_hash authorizes exactly one request, ever.
+    replay: UsedTxStore,
 }
 
 impl DirectProvider {
@@ -130,6 +237,7 @@ impl DirectProvider {
         operator_key: String,
         payment_token: Option<String>,
         min_confirmations: u64,
+        replay_store_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
         use alloy::signers::local::PrivateKeySigner;
         let signer: PrivateKeySigner = operator_key.parse()?;
@@ -146,52 +254,26 @@ impl DirectProvider {
             operator_address,
             expected_token,
             min_confirmations,
-            used_tx_hashes: tokio::sync::RwLock::new(std::collections::HashSet::new()),
+            replay: UsedTxStore::load(replay_store_path),
         })
     }
-}
 
-#[async_trait]
-impl PaymentProvider for DirectProvider {
-    async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
-        let PaymentProof::DirectTransfer {
-            tx_hash,
-            from,
-            amount,
-            token: _,
-        } = proof
-        else {
-            anyhow::bail!(
-                "DirectProvider requires DirectTransfer proof, got {:?}",
-                std::mem::discriminant(proof)
-            );
-        };
-
-        // ── Replay protection: each tx_hash can only authorize ONE request ──
-        {
-            let mut used = self.used_tx_hashes.write().await;
-            if used.contains(tx_hash) {
-                anyhow::bail!("tx_hash {tx_hash} already used — replay rejected");
-            }
-            // Insert BEFORE verification so a concurrent request can't race past
-            used.insert(tx_hash.clone());
-        }
-
+    /// Verify the on-chain ERC-20 transfer named by the proof. Pure read — does
+    /// no replay bookkeeping (the caller reserves before and commits after), so
+    /// a transient failure here never burns a legitimate tx hash.
+    async fn verify_transfer(&self, tx_hash: &str, from: &str, amount: &str) -> anyhow::Result<u64> {
         use alloy::providers::{Provider, ProviderBuilder};
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.clone());
 
-        // Parse tx hash
         let hash: alloy::primitives::B256 = tx_hash
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid tx_hash: {e}"))?;
 
-        // Get receipt
         let receipt = provider
             .get_transaction_receipt(hash)
             .await?
             .ok_or_else(|| anyhow::anyhow!("tx {tx_hash} not found — not yet confirmed?"))?;
 
-        // ── Require block_number (reject pending/unconfirmed txs) ──
         let block_number = receipt.block_number.ok_or_else(|| {
             anyhow::anyhow!("tx {tx_hash} has no block number — pending or unconfirmed")
         })?;
@@ -207,7 +289,6 @@ impl PaymentProvider for DirectProvider {
             }
         }
 
-        // Check status (1 = success)
         if !receipt.status() {
             anyhow::bail!("tx {tx_hash} reverted");
         }
@@ -232,12 +313,12 @@ impl PaymentProvider for DirectProvider {
                 continue;
             }
 
-            // Token MUST match the configured expected_token (no longer optional)
+            // Token MUST match the configured expected_token.
             if log.address() != self.expected_token {
                 continue;
             }
 
-            // Verify sender matches the claimed `from` (if provided)
+            // Log (don't reject) a 'from' mismatch — the operator was still paid.
             if !from.is_empty() {
                 if let Ok(claimed_from) = from.parse::<Address>() {
                     let actual_from = Address::from_slice(&topics[1].as_slice()[12..]);
@@ -248,14 +329,12 @@ impl PaymentProvider for DirectProvider {
                             actual_from = %actual_from,
                             "DirectTransfer 'from' mismatch — claimed sender differs from actual Transfer sender"
                         );
-                        // Don't reject — the payment is still valid (operator got paid).
-                        // But log it for fraud detection.
                     }
                 }
             }
 
-            // data = amount (uint256). Cap at u64::MAX (safe — only inflates,
-            // never deflates, so an attacker can't underpay this way).
+            // data = amount (uint256). Cap at u64::MAX (only inflates, never
+            // deflates — an attacker can't underpay this way).
             let value = alloy::primitives::U256::from_be_slice(log.data().data.as_ref());
             found_amount = value.try_into().unwrap_or(u64::MAX);
             found = true;
@@ -270,19 +349,48 @@ impl PaymentProvider for DirectProvider {
             );
         }
 
-        // ── Parse requested amount strictly — no silent 0 fallback ──
         let requested: u64 = amount
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid amount in proof: {e}"))?;
         if found_amount < requested {
-            anyhow::bail!(
-                "transferred amount ({found_amount}) is less than requested ({requested})"
-            );
+            anyhow::bail!("transferred amount ({found_amount}) is less than requested ({requested})");
         }
 
-        tracing::info!(tx_hash, amount = found_amount, "direct payment verified");
-
         Ok(found_amount)
+    }
+}
+
+#[async_trait]
+impl PaymentProvider for DirectProvider {
+    async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
+        let PaymentProof::DirectTransfer {
+            tx_hash,
+            from,
+            amount,
+            token: _,
+        } = proof
+        else {
+            anyhow::bail!(
+                "DirectProvider requires DirectTransfer proof, got {:?}",
+                std::mem::discriminant(proof)
+            );
+        };
+
+        // Reserve the tx hash (rejects replay + concurrent use), then verify
+        // on-chain. Commit only on success so a transient RPC failure releases
+        // the reservation and a legitimate payer can retry.
+        self.replay.reserve(tx_hash).await?;
+        match self.verify_transfer(tx_hash, from, amount).await {
+            Ok(found_amount) => {
+                self.replay.commit(tx_hash).await;
+                tracing::info!(tx_hash, amount = found_amount, "direct payment verified");
+                Ok(found_amount)
+            }
+            Err(e) => {
+                self.replay.release(tx_hash).await;
+                Err(e)
+            }
+        }
     }
 
     async fn settle(&self, _proof: &PaymentProof, _actual_cost: u64) -> anyhow::Result<()> {
@@ -329,10 +437,65 @@ impl PaymentProvider for NoopProvider {
     }
 }
 
+// ─── CompositeProvider ────────────────────────────────────────────────
+
+/// Accept BOTH rails on one endpoint, dispatched by the proof type: a
+/// `SpendAuth` proof routes to the shielded provider, a `DirectTransfer` proof
+/// to the direct provider. `operator_address` is the same key for both, so a
+/// claim/transfer lands in the same place regardless of how the buyer paid.
+pub struct CompositeProvider {
+    shielded: ShieldedProvider,
+    direct: DirectProvider,
+}
+
+impl CompositeProvider {
+    pub fn new(shielded: ShieldedProvider, direct: DirectProvider) -> Self {
+        Self { shielded, direct }
+    }
+}
+
+#[async_trait]
+impl PaymentProvider for CompositeProvider {
+    async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
+        match proof {
+            PaymentProof::SpendAuth(_) => self.shielded.authorize(proof).await,
+            PaymentProof::DirectTransfer { .. } => self.direct.authorize(proof).await,
+        }
+    }
+
+    async fn settle(&self, proof: &PaymentProof, actual_cost: u64) -> anyhow::Result<()> {
+        match proof {
+            PaymentProof::SpendAuth(_) => self.shielded.settle(proof, actual_cost).await,
+            PaymentProof::DirectTransfer { .. } => self.direct.settle(proof, actual_cost).await,
+        }
+    }
+
+    fn operator_address(&self) -> Address {
+        // Both providers derive from the same operator key.
+        self.shielded.operator_address()
+    }
+}
+
 // ─── Factory ──────────────────────────────────────────────────────────
 
 // Re-export PaymentMode from config so consumers can import from payment module
 pub use crate::config::PaymentMode;
+
+fn build_direct(tangle: &TangleConfig, billing: &BillingConfig) -> anyhow::Result<DirectProvider> {
+    if billing.payment_token_address.is_none() {
+        anyhow::bail!(
+            "direct payment requires payment_token_address in billing config — \
+             without it, attackers can pay with worthless tokens"
+        );
+    }
+    DirectProvider::new(
+        tangle.rpc_url.clone(),
+        tangle.operator_key.clone(),
+        billing.payment_token_address.clone(),
+        1, // min confirmations
+        billing.direct_replay_store_path.clone(),
+    )
+}
 
 /// Create a payment provider from config.
 pub fn create_provider(
@@ -343,19 +506,84 @@ pub fn create_provider(
     match mode {
         PaymentMode::None => Ok(Box::new(NoopProvider::new(tangle.operator_key.clone())?)),
         PaymentMode::Shielded => Ok(Box::new(ShieldedProvider::new(tangle, billing)?)),
-        PaymentMode::Direct => {
-            if billing.payment_token_address.is_none() {
-                anyhow::bail!(
-                    "payment_mode=direct requires payment_token_address in billing config — \
-                     without it, attackers can pay with worthless tokens"
-                );
-            }
-            Ok(Box::new(DirectProvider::new(
-                tangle.rpc_url.clone(),
-                tangle.operator_key.clone(),
-                billing.payment_token_address.clone(),
-                1, // min confirmations
-            )?))
+        PaymentMode::Direct => Ok(Box::new(build_direct(tangle, billing)?)),
+        PaymentMode::Both => Ok(Box::new(CompositeProvider::new(
+            ShieldedProvider::new(tangle, billing)?,
+            build_direct(tangle, billing)?,
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tx(n: u8) -> String {
+        format!("0x{:064x}", n)
+    }
+
+    #[tokio::test]
+    async fn reserve_rejects_replay_and_concurrent() {
+        let store = UsedTxStore::load(None);
+        // First reserve succeeds.
+        store.reserve(&tx(1)).await.unwrap();
+        // Same tx again while in-flight → rejected.
+        assert!(store.reserve(&tx(1)).await.is_err(), "concurrent reserve must fail");
+        // Commit it; now it's consumed.
+        store.commit(&tx(1)).await;
+        assert!(store.is_used(&tx(1)).await);
+        // A reserve of a consumed tx → rejected as replay.
+        assert!(store.reserve(&tx(1)).await.is_err(), "replay must fail");
+    }
+
+    #[tokio::test]
+    async fn release_allows_retry_after_transient_failure() {
+        let store = UsedTxStore::load(None);
+        store.reserve(&tx(2)).await.unwrap();
+        // Verification "failed" → release the reservation.
+        store.release(&tx(2)).await;
+        assert!(!store.is_used(&tx(2)).await, "released tx must not be consumed");
+        // The legitimate payer can retry.
+        store.reserve(&tx(2)).await.unwrap();
+        store.commit(&tx(2)).await;
+        assert!(store.is_used(&tx(2)).await);
+    }
+
+    #[tokio::test]
+    async fn consumed_tx_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("used-tx.json");
+
+        // Operator run 1: consume a payment tx.
+        {
+            let store = UsedTxStore::load(Some(path.clone()));
+            store.reserve(&tx(3)).await.unwrap();
+            store.commit(&tx(3)).await;
         }
+        // Operator restart: a fresh store loads the persisted set and STILL
+        // rejects the same tx — the bug this fixes (in-memory store forgot it).
+        {
+            let store = UsedTxStore::load(Some(path.clone()));
+            assert!(store.is_used(&tx(3)).await, "consumed tx must persist across restart");
+            assert!(
+                store.reserve(&tx(3)).await.is_err(),
+                "replay of a past payment after restart must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn released_tx_is_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("used-tx.json");
+        {
+            let store = UsedTxStore::load(Some(path.clone()));
+            store.reserve(&tx(4)).await.unwrap();
+            store.release(&tx(4)).await; // transient failure
+        }
+        // After restart, a released (never-verified) tx is still spendable.
+        let store = UsedTxStore::load(Some(path));
+        assert!(!store.is_used(&tx(4)).await);
+        assert!(store.reserve(&tx(4)).await.is_ok(), "a never-committed tx must remain usable");
     }
 }

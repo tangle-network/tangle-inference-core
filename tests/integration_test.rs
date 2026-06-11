@@ -60,6 +60,7 @@ fn test_billing_config() -> BillingConfig {
         clock_skew_tolerance_secs: 30,
         max_gas_price_gwei: 0,
         nonce_store_path: None,
+        direct_replay_store_path: None,
         payment_token_address: None,
     }
 }
@@ -1055,7 +1056,8 @@ mod anvil_e2e {
             rpc.clone(),
             TEST_OPERATOR_KEY.into(),
             Some(format!("{:#x}", token_addr)),
-            0, // 0 confirmations for test (anvil auto-mines)
+            0, // 0 confirmations for test (anvil auto-mines),
+            None, // replay store (in-memory for test)
         )
         .unwrap();
 
@@ -1130,6 +1132,7 @@ mod anvil_e2e {
             TEST_OPERATOR_KEY.into(),
             Some(format!("{:#x}", token_addr)),
             0,
+            None, // replay store (in-memory for test)
         )
         .unwrap();
 
@@ -1204,6 +1207,7 @@ mod anvil_e2e {
             TEST_OPERATOR_KEY.into(),
             Some(format!("{:#x}", token_addr)),
             0,
+            None, // replay store (in-memory for test)
         )
         .unwrap();
 
@@ -1274,6 +1278,7 @@ mod anvil_e2e {
             TEST_OPERATOR_KEY.into(),
             Some(format!("{:#x}", token_addr)),
             0,
+            None, // replay store (in-memory for test)
         )
         .unwrap();
 
@@ -1310,6 +1315,7 @@ mod anvil_e2e {
             TEST_OPERATOR_KEY.into(),
             Some("0x0000000000000000000000000000000000000001".into()),
             0,
+            None, // replay store (in-memory for test)
         )
         .unwrap();
 
@@ -1336,6 +1342,7 @@ fn direct_provider_rejects_missing_token() {
         TEST_OPERATOR_KEY.into(),
         None, // no token = must fail
         1,
+        None, // replay store (in-memory for test)
     );
     assert!(
         result.is_err(),
@@ -1356,6 +1363,7 @@ fn direct_provider_rejects_invalid_rpc_url() {
         TEST_OPERATOR_KEY.into(),
         Some("0x0000000000000000000000000000000000000001".into()),
         1,
+        None, // replay store (in-memory for test)
     );
     assert!(result.is_err());
 }
@@ -1368,6 +1376,7 @@ fn direct_provider_rejects_invalid_operator_key() {
         "garbage".into(),
         Some("0x0000000000000000000000000000000000000001".into()),
         1,
+        None, // replay store (in-memory for test)
     );
     assert!(result.is_err());
 }
@@ -1380,6 +1389,7 @@ fn direct_provider_rejects_invalid_token_address() {
         TEST_OPERATOR_KEY.into(),
         Some("not-an-address".into()),
         1,
+        None, // replay store (in-memory for test)
     );
     assert!(result.is_err());
 }

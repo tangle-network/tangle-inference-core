@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         clock_skew_tolerance_secs: 30,
         max_gas_price_gwei: 0,
         nonce_store_path: None,
+        direct_replay_store_path: None,
         payment_token_address: None,
     };
     let server_cfg = ServerConfig {
