@@ -708,9 +708,9 @@ async fn app_state_from_config_constructs_correctly() {
 // - NoopProvider never rejects
 // - ShieldedProvider rejects DirectTransfer proofs
 // - DirectProvider rejects SpendAuth proofs
-// - PaymentMode config creates the right provider
+// - PaymentRails config creates the right provider
 // - PaymentProof serde round-trip (callers send JSON, we deserialize)
-// - create_provider factory with each mode
+// - create_provider factory with each rail set
 
 use tangle_inference_core::payment::{
     create_provider, NoopProvider, PaymentProof, PaymentProvider, PaymentRails, PaymentRouter,
@@ -933,6 +933,37 @@ async fn router_rejects_proof_for_disabled_rail() {
     assert!(
         err.to_string().contains("direct rail not enabled"),
         "expected disabled-rail rejection, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn router_dispatches_each_proof_to_its_rail() {
+    // A BOTH router must route each proof to the matching provider rather than
+    // reject it. We can't fully authorize without a chain, so we assert the
+    // dispatch got PAST the rail check — the error is anything but "not enabled".
+    let tangle = test_tangle_config();
+    let mut billing = test_billing_config();
+    let token = "0x0000000000000000000000000000000000000001";
+    billing.payment_token_address = Some(token.into());
+    let router = PaymentRouter::build(PaymentRails::BOTH, &tangle, &billing).unwrap();
+
+    let direct = PaymentProof::DirectTransfer {
+        tx_hash: "0x00".into(),
+        from: "0x00".into(),
+        amount: "1".into(),
+        token: token.into(),
+    };
+    let direct_err = router.authorize(&direct).await.unwrap_err().to_string();
+    assert!(
+        !direct_err.contains("not enabled"),
+        "direct proof should route to the direct rail, got: {direct_err}"
+    );
+
+    let shielded = PaymentProof::SpendAuth(test_spend_auth_payload());
+    let shielded_err = router.authorize(&shielded).await.unwrap_err().to_string();
+    assert!(
+        !shielded_err.contains("not enabled"),
+        "spend-auth proof should route to the shielded rail, got: {shielded_err}"
     );
 }
 

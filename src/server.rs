@@ -140,10 +140,17 @@ impl NonceStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &data).is_ok() {
-            if let Err(e) = std::fs::rename(&tmp, path) {
-                tracing::warn!(error = %e, "failed to persist nonce store");
-            }
+        // A dropped write here means a consumed nonce is live in memory but absent
+        // from disk — a restart would let that SpendAuth signature be replayed.
+        // Surface it at error level instead of swallowing it.
+        if let Err(e) = std::fs::write(&tmp, &data) {
+            tracing::error!(error = %e, "failed to write nonce store \
+                — replay protection will not survive a restart");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            tracing::error!(error = %e, "failed to persist nonce store \
+                — replay protection will not survive a restart");
         }
     }
 }
@@ -363,31 +370,18 @@ impl AppStateBuilder {
             .unwrap_or(server_config.max_concurrent_requests);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
 
-        // Payment provider: use explicit if provided, otherwise create NoopProvider
-        // as fallback (blueprints using from_config always get the right one).
+        // Payment provider: explicit if set, otherwise built from the configured
+        // rails. A misconfiguration (e.g. the Direct rail without a token address)
+        // fails startup loudly rather than silently downgrading to shielded-only —
+        // the billing config means exactly what it says. `create_provider` already
+        // maps an empty rail set to a NoopProvider, so unbilled operators still build.
         let payment_provider = match self.payment_provider {
             Some(p) => p,
-            None => {
-                // Fallback: build from the configured rails, or noop.
-                match create_provider(
-                    billing_config.payment_rails,
-                    &tangle_config,
-                    &billing_config,
-                ) {
-                    Ok(p) => {
-                        let p: Arc<dyn PaymentProvider> = Arc::from(p);
-                        p
-                    }
-                    Err(_) => {
-                        // If provider creation fails (e.g. Direct without token),
-                        // fall back to a ShieldedProvider wrapping the billing client.
-                        Arc::new(crate::payment::ShieldedProvider::new(
-                            &tangle_config,
-                            &billing_config,
-                        )?) as Arc<dyn PaymentProvider>
-                    }
-                }
-            }
+            None => Arc::from(create_provider(
+                billing_config.payment_rails,
+                &tangle_config,
+                &billing_config,
+            )?),
         };
 
         Ok(AppState {
