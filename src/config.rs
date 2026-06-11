@@ -83,6 +83,7 @@ pub struct ServerConfig {
 /// type (see [`crate::payment::PaymentRouter`]). Adding a new rail is one more
 /// flag here plus a `PaymentProvider` impl — never an enum cross-product.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PaymentRails {
     /// ShieldedCredits SpendAuth — private, prepaid shielded-pool balance.
     #[serde(default)]
@@ -124,7 +125,12 @@ impl Default for PaymentRails {
 }
 
 /// Billing configuration.
+///
+/// `deny_unknown_fields` makes a stale or mistyped key (e.g. the removed
+/// `payment_mode`) a loud config-load error rather than a silent default —
+/// fail-closed, since these settings govern who pays and how much.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BillingConfig {
     /// Which payment rails this operator accepts. Default: shielded only.
     /// e.g. `{ shielded = true, direct = true }` to take both.
@@ -288,5 +294,40 @@ mod tests {
         assert_eq!(cfg.claim_max_retries, 3);
         assert_eq!(cfg.clock_skew_tolerance_secs, 30);
         assert_eq!(cfg.max_gas_price_gwei, 0);
+        // The headline change of this file: the serde default must be shielded-only.
+        assert_eq!(cfg.payment_rails, PaymentRails::SHIELDED);
+    }
+
+    #[test]
+    fn test_billing_config_rejects_stale_payment_mode() {
+        // A config carrying the removed `payment_mode` key must fail loudly
+        // (deny_unknown_fields) instead of silently defaulting to shielded.
+        let json = r#"{
+            "max_spend_per_request": 1000000,
+            "min_credit_balance": 1000,
+            "payment_mode": "both"
+        }"#;
+        assert!(serde_json::from_str::<BillingConfig>(json).is_err());
+    }
+
+    #[test]
+    fn test_payment_rails_serde_round_trip() {
+        for rails in [
+            PaymentRails::NONE,
+            PaymentRails::SHIELDED,
+            PaymentRails::DIRECT,
+            PaymentRails::BOTH,
+        ] {
+            let s = serde_json::to_string(&rails).unwrap();
+            let back: PaymentRails = serde_json::from_str(&s).unwrap();
+            assert_eq!(rails, back, "round-trip mismatch for {rails:?}");
+        }
+        // Empty object → the field defaults, NONE has both flags false.
+        assert_eq!(
+            serde_json::from_str::<PaymentRails>("{}").unwrap(),
+            PaymentRails::NONE
+        );
+        // A typo'd rail key is rejected, not silently treated as a default.
+        assert!(serde_json::from_str::<PaymentRails>(r#"{"direc": true}"#).is_err());
     }
 }

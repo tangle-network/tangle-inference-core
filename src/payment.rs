@@ -210,10 +210,17 @@ impl UsedTxStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &data).is_ok() {
-            if let Err(e) = std::fs::rename(&tmp, path) {
-                tracing::warn!(error = %e, "failed to persist direct-transfer tx store");
-            }
+        // A dropped write here means a consumed tx is live in memory but absent
+        // from disk — a restart would let that transfer be replayed for free
+        // inference. Surface it at error level instead of swallowing it.
+        if let Err(e) = std::fs::write(&tmp, &data) {
+            tracing::error!(error = %e, "failed to write direct-transfer tx store \
+                — replay protection will not survive a restart");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            tracing::error!(error = %e, "failed to persist direct-transfer tx store \
+                — replay protection will not survive a restart");
         }
     }
 
@@ -485,60 +492,64 @@ impl PaymentRouter {
         tangle: &TangleConfig,
         billing: &BillingConfig,
     ) -> anyhow::Result<Self> {
-        use alloy::signers::local::PrivateKeySigner;
-        let operator_address = tangle.operator_key.parse::<PrivateKeySigner>()?.address();
+        // A rail-less router would build cleanly but reject every request — a
+        // sharp edge on a pub API. Fail at construction, matching `create_provider`.
+        if rails.is_empty() {
+            anyhow::bail!(
+                "PaymentRouter requires at least one enabled rail \
+                 (use create_provider for the open/unbilled case)"
+            );
+        }
+        let shielded = rails
+            .shielded
+            .then(|| ShieldedProvider::new(tangle, billing))
+            .transpose()?;
+        let direct = rails
+            .direct
+            .then(|| build_direct(tangle, billing))
+            .transpose()?;
+        // Take the payout address from a real sub-provider rather than re-deriving
+        // it from the key: one canonical derivation, no chance of divergence, and
+        // the empty-rails guard above guarantees at least one exists.
+        let operator_address = shielded
+            .as_ref()
+            .map(|p| p.operator_address())
+            .or_else(|| direct.as_ref().map(|p| p.operator_address()))
+            .expect("non-empty rails guarantees a provider");
         Ok(Self {
-            shielded: rails
-                .shielded
-                .then(|| ShieldedProvider::new(tangle, billing))
-                .transpose()?,
-            direct: rails
-                .direct
-                .then(|| build_direct(tangle, billing))
-                .transpose()?,
+            shielded,
+            direct,
             operator_address,
         })
+    }
+
+    /// Route a proof to the provider for its rail, erroring if that rail is
+    /// disabled. Single dispatch point so `authorize`/`settle` cannot drift and
+    /// a new `PaymentProof` variant fails to compile until it is handled here.
+    fn provider_for(&self, proof: &PaymentProof) -> anyhow::Result<&dyn PaymentProvider> {
+        match proof {
+            PaymentProof::SpendAuth(_) => self
+                .shielded
+                .as_ref()
+                .map(|p| p as &dyn PaymentProvider)
+                .ok_or_else(|| anyhow::anyhow!("shielded rail not enabled on this operator")),
+            PaymentProof::DirectTransfer { .. } => self
+                .direct
+                .as_ref()
+                .map(|p| p as &dyn PaymentProvider)
+                .ok_or_else(|| anyhow::anyhow!("direct rail not enabled on this operator")),
+        }
     }
 }
 
 #[async_trait]
 impl PaymentProvider for PaymentRouter {
     async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
-        match proof {
-            PaymentProof::SpendAuth(_) => {
-                self.shielded
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("shielded rail not enabled on this operator"))?
-                    .authorize(proof)
-                    .await
-            }
-            PaymentProof::DirectTransfer { .. } => {
-                self.direct
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("direct rail not enabled on this operator"))?
-                    .authorize(proof)
-                    .await
-            }
-        }
+        self.provider_for(proof)?.authorize(proof).await
     }
 
     async fn settle(&self, proof: &PaymentProof, actual_cost: u64) -> anyhow::Result<()> {
-        match proof {
-            PaymentProof::SpendAuth(_) => {
-                self.shielded
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("shielded rail not enabled on this operator"))?
-                    .settle(proof, actual_cost)
-                    .await
-            }
-            PaymentProof::DirectTransfer { .. } => {
-                self.direct
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("direct rail not enabled on this operator"))?
-                    .settle(proof, actual_cost)
-                    .await
-            }
-        }
+        self.provider_for(proof)?.settle(proof, actual_cost).await
     }
 
     fn operator_address(&self) -> Address {
