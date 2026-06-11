@@ -32,6 +32,17 @@ pub enum PaymentProof {
     },
 }
 
+impl PaymentProof {
+    /// Stable identity of the payer, for per-account rate limiting across rails:
+    /// the shielded commitment, or the direct transfer's sender address.
+    pub fn payer_id(&self) -> &str {
+        match self {
+            PaymentProof::SpendAuth(sa) => &sa.commitment,
+            PaymentProof::DirectTransfer { from, .. } => from,
+        }
+    }
+}
+
 /// Result of payment authorization.
 #[derive(Debug, Clone)]
 pub struct AuthorizationResult {
@@ -138,7 +149,10 @@ impl UsedTxStore {
             .unwrap_or_default();
 
         if path.is_some() {
-            tracing::info!(count = used.len(), "loaded persisted direct-transfer tx hashes");
+            tracing::info!(
+                count = used.len(),
+                "loaded persisted direct-transfer tx hashes"
+            );
         } else {
             tracing::warn!(
                 "direct_replay_store_path not configured — used tx hashes are in-memory only. \
@@ -147,7 +161,10 @@ impl UsedTxStore {
         }
 
         Self {
-            inner: tokio::sync::Mutex::new(UsedTxInner { used, in_flight: HashSet::new() }),
+            inner: tokio::sync::Mutex::new(UsedTxInner {
+                used,
+                in_flight: HashSet::new(),
+            }),
             path,
         }
     }
@@ -261,7 +278,12 @@ impl DirectProvider {
     /// Verify the on-chain ERC-20 transfer named by the proof. Pure read — does
     /// no replay bookkeeping (the caller reserves before and commits after), so
     /// a transient failure here never burns a legitimate tx hash.
-    async fn verify_transfer(&self, tx_hash: &str, from: &str, amount: &str) -> anyhow::Result<u64> {
+    async fn verify_transfer(
+        &self,
+        tx_hash: &str,
+        from: &str,
+        amount: &str,
+    ) -> anyhow::Result<u64> {
         use alloy::providers::{Provider, ProviderBuilder};
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.clone());
 
@@ -353,7 +375,9 @@ impl DirectProvider {
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid amount in proof: {e}"))?;
         if found_amount < requested {
-            anyhow::bail!("transferred amount ({found_amount}) is less than requested ({requested})");
+            anyhow::bail!(
+                "transferred amount ({found_amount}) is less than requested ({requested})"
+            );
         }
 
         Ok(found_amount)
@@ -468,7 +492,10 @@ impl PaymentRouter {
                 .shielded
                 .then(|| ShieldedProvider::new(tangle, billing))
                 .transpose()?,
-            direct: rails.direct.then(|| build_direct(tangle, billing)).transpose()?,
+            direct: rails
+                .direct
+                .then(|| build_direct(tangle, billing))
+                .transpose()?,
             operator_address,
         })
     }
@@ -565,7 +592,10 @@ mod tests {
         // First reserve succeeds.
         store.reserve(&tx(1)).await.unwrap();
         // Same tx again while in-flight → rejected.
-        assert!(store.reserve(&tx(1)).await.is_err(), "concurrent reserve must fail");
+        assert!(
+            store.reserve(&tx(1)).await.is_err(),
+            "concurrent reserve must fail"
+        );
         // Commit it; now it's consumed.
         store.commit(&tx(1)).await;
         assert!(store.is_used(&tx(1)).await);
@@ -579,7 +609,10 @@ mod tests {
         store.reserve(&tx(2)).await.unwrap();
         // Verification "failed" → release the reservation.
         store.release(&tx(2)).await;
-        assert!(!store.is_used(&tx(2)).await, "released tx must not be consumed");
+        assert!(
+            !store.is_used(&tx(2)).await,
+            "released tx must not be consumed"
+        );
         // The legitimate payer can retry.
         store.reserve(&tx(2)).await.unwrap();
         store.commit(&tx(2)).await;
@@ -601,7 +634,10 @@ mod tests {
         // rejects the same tx — the bug this fixes (in-memory store forgot it).
         {
             let store = UsedTxStore::load(Some(path.clone()));
-            assert!(store.is_used(&tx(3)).await, "consumed tx must persist across restart");
+            assert!(
+                store.is_used(&tx(3)).await,
+                "consumed tx must persist across restart"
+            );
             assert!(
                 store.reserve(&tx(3)).await.is_err(),
                 "replay of a past payment after restart must be rejected"
@@ -621,6 +657,9 @@ mod tests {
         // After restart, a released (never-verified) tx is still spendable.
         let store = UsedTxStore::load(Some(path));
         assert!(!store.is_used(&tx(4)).await);
-        assert!(store.reserve(&tx(4)).await.is_ok(), "a never-committed tx must remain usable");
+        assert!(
+            store.reserve(&tx(4)).await.is_ok(),
+            "a never-committed tx must remain usable"
+        );
     }
 }

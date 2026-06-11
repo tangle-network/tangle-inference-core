@@ -369,7 +369,11 @@ impl AppStateBuilder {
             Some(p) => p,
             None => {
                 // Fallback: build from the configured rails, or noop.
-                match create_provider(billing_config.payment_rails, &tangle_config, &billing_config) {
+                match create_provider(
+                    billing_config.payment_rails,
+                    &tangle_config,
+                    &billing_config,
+                ) {
                     Ok(p) => {
                         let p: Arc<dyn PaymentProvider> = Arc::from(p);
                         p
@@ -914,4 +918,167 @@ pub async fn settle_billing_with_recovery(
     }
 
     Ok(())
+}
+
+// ─── Unified, rail-agnostic request billing ───────────────────────────────────
+//
+// One reusable orchestration so a blueprint's request handler never re-implements
+// per-rail billing: resolve a proof, authorize it (dispatched by rail), then
+// settle it. Shielded and direct differ only inside these functions; the handler
+// is identical for both.
+
+/// A request's authorized payment, carried from the gate to settlement. Holds the
+/// per-account RAII guard so the in-flight count stays balanced across serving.
+pub struct AuthorizedPayment {
+    pub proof: PaymentProof,
+    /// Shielded pre-auth amount (the contract claims up to this). None for direct
+    /// (already paid in full).
+    pub preauth: Option<u64>,
+    _account_guard: Option<AccountGuard>,
+}
+
+/// Resolve a request's payment proof, in priority order: an explicit
+/// `DirectTransfer` payment, a body `spend_auth`, or an `X-Payment-Signature`
+/// header. None when the caller sent no proof.
+pub fn resolve_payment_proof(
+    headers: &HeaderMap,
+    body_spend_auth: Option<SpendAuthPayload>,
+    body_payment: Option<PaymentProof>,
+) -> Option<PaymentProof> {
+    if let Some(p) = body_payment {
+        Some(p)
+    } else if let Some(sa) = body_spend_auth {
+        Some(PaymentProof::SpendAuth(sa))
+    } else {
+        extract_x402_spend_auth(headers).map(PaymentProof::SpendAuth)
+    }
+}
+
+/// Rail-agnostic pre-serve authorization. The order matters and is shared by all
+/// rails: **per-account limit → validate → health → commit**, so a malformed or
+/// over-limit request gets a precise 4xx (not a backend-health 503) and the
+/// operator never commits gas / verifies payment for a backend it can't serve.
+///   - **SpendAuth**: validate (sig / nonce / amount / operator) + pre-auth
+///     ceiling (≤ 1.5× estimated, since the contract claims the full pre-auth),
+///     then on-chain `authorizeSpend`.
+///   - **DirectTransfer**: verify the on-chain transfer via the payment provider
+///     (already paid; nothing to pre-authorize).
+///
+/// `is_healthy` is the backend readiness check, polled only after validation.
+/// Returns the authorization to carry into [`settle_request`], or the 4xx
+/// `Response` to hand back.
+pub async fn authorize_request(
+    state: &AppState,
+    proof: PaymentProof,
+    estimated_max_cost: u64,
+    is_healthy: impl std::future::Future<Output = bool> + Send,
+) -> Result<AuthorizedPayment, Response> {
+    // Per-account in-flight limit, keyed by payer identity (commitment / sender).
+    // The guard releases the slot on any early return below.
+    let max_per_account = state.server_config.max_per_account_requests;
+    let account_guard = if max_per_account > 0 {
+        match AccountGuard::acquire(
+            proof.payer_id().to_string(),
+            state.active_per_account.clone(),
+            max_per_account,
+        ) {
+            Some(g) => Some(g),
+            None => {
+                return Err(error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("account has too many active requests (limit: {max_per_account})"),
+                    "rate_limit_error",
+                    "per_account_limit",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Validate FIRST (cheap, precise errors) — before the backend-health check.
+    let preauth = match &proof {
+        PaymentProof::SpendAuth(spend_auth) => {
+            let preauth = validate_spend_auth(state, spend_auth).await?;
+            // The contract claims the FULL pre-auth, so reject an authorization
+            // that exceeds 1.5× the estimated max cost (overcharge protection).
+            let ceiling = estimated_max_cost.saturating_mul(3) / 2;
+            if estimated_max_cost > 0 && preauth > ceiling {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "pre-auth amount ({preauth}) exceeds 1.5x estimated max cost \
+                         ({estimated_max_cost}) — reduce amount to avoid overcharging"
+                    ),
+                    "billing_error",
+                    "excessive_preauth",
+                ));
+            }
+            Some(preauth)
+        }
+        PaymentProof::DirectTransfer { .. } => None,
+    };
+
+    // Don't commit gas / verify a payment for a backend we can't serve.
+    if !is_healthy.await {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "inference backend is unavailable — payment not committed".to_string(),
+            "upstream_error",
+            "vllm_unhealthy",
+        ));
+    }
+
+    // Commit: shielded authorizes on-chain; direct verifies the transfer.
+    match &proof {
+        PaymentProof::SpendAuth(spend_auth) => {
+            if let Err(e) = state.billing.authorize_spend(spend_auth).await {
+                tracing::error!(error = %e, "authorizeSpend failed");
+                return Err(error_response(
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!("billing authorization failed: {e}"),
+                    "billing_error",
+                    "authorization_failed",
+                ));
+            }
+        }
+        PaymentProof::DirectTransfer { .. } => {
+            if let Err(e) = state.payment_provider.authorize(&proof).await {
+                return Err(error_response(
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!("direct payment verification failed: {e}"),
+                    "billing_error",
+                    "authorization_failed",
+                ));
+            }
+        }
+    }
+
+    Ok(AuthorizedPayment {
+        proof,
+        preauth,
+        _account_guard: account_guard,
+    })
+}
+
+/// Settle a request's payment after serving, dispatched by rail. Shielded claims
+/// up to the pre-auth (with dead-letter recovery on failure); direct is already
+/// paid (no-op). Errors are logged, not propagated — a settlement failure must
+/// not fail the already-served response.
+pub async fn settle_request(state: &AppState, auth: &AuthorizedPayment, actual_cost: u64) {
+    if let PaymentProof::SpendAuth(ref spend_auth) = auth.proof {
+        if let Some(preauth) = auth.preauth {
+            if let Err(e) = settle_billing_with_recovery(
+                &state.billing,
+                spend_auth,
+                preauth,
+                actual_cost,
+                state.settlement_recovery_queue.as_deref(),
+            )
+            .await
+            {
+                tracing::error!(error = %e, "settlement failed (enqueued for recovery if configured)");
+            }
+        }
+    }
 }

@@ -713,7 +713,8 @@ async fn app_state_from_config_constructs_correctly() {
 // - create_provider factory with each mode
 
 use tangle_inference_core::payment::{
-    create_provider, NoopProvider, PaymentProof, PaymentProvider, PaymentRails, PaymentRouter, ShieldedProvider,
+    create_provider, NoopProvider, PaymentProof, PaymentProvider, PaymentRails, PaymentRouter,
+    ShieldedProvider,
 };
 
 /// Anvil default account #0 private key.
@@ -936,6 +937,46 @@ async fn router_rejects_proof_for_disabled_rail() {
 }
 
 #[test]
+fn payment_proof_payer_id() {
+    let sa = PaymentProof::SpendAuth(test_spend_auth_payload());
+    assert_eq!(
+        sa.payer_id(),
+        "0x0000000000000000000000000000000000000000000000000000000000000001"
+    );
+    let direct = PaymentProof::DirectTransfer {
+        tx_hash: "0x1".into(),
+        from: "0xabc".into(),
+        amount: "1".into(),
+        token: "0x2".into(),
+    };
+    assert_eq!(direct.payer_id(), "0xabc");
+}
+
+#[test]
+fn resolve_payment_proof_priority() {
+    use tangle_inference_core::server::resolve_payment_proof;
+    let h = axum::http::HeaderMap::new();
+    let direct = PaymentProof::DirectTransfer {
+        tx_hash: "0x1".into(),
+        from: "0xa".into(),
+        amount: "1".into(),
+        token: "0x2".into(),
+    };
+    // explicit DirectTransfer payment wins over a body spend_auth
+    assert!(matches!(
+        resolve_payment_proof(&h, Some(test_spend_auth_payload()), Some(direct)),
+        Some(PaymentProof::DirectTransfer { .. })
+    ));
+    // body spend_auth when no direct payment
+    assert!(matches!(
+        resolve_payment_proof(&h, Some(test_spend_auth_payload()), None),
+        Some(PaymentProof::SpendAuth(_))
+    ));
+    // nothing → None
+    assert!(resolve_payment_proof(&h, None, None).is_none());
+}
+
+#[test]
 fn noop_provider_operator_address_matches_key() {
     let provider = NoopProvider::new(TEST_OPERATOR_KEY.to_string()).unwrap();
     let expected: Address = test_operator_signer().address();
@@ -1082,7 +1123,7 @@ mod anvil_e2e {
             rpc.clone(),
             TEST_OPERATOR_KEY.into(),
             Some(format!("{:#x}", token_addr)),
-            0, // 0 confirmations for test (anvil auto-mines),
+            0,    // 0 confirmations for test (anvil auto-mines),
             None, // replay store (in-memory for test)
         )
         .unwrap();

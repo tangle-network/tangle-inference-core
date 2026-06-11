@@ -94,10 +94,22 @@ pub struct PaymentRails {
 }
 
 impl PaymentRails {
-    pub const NONE: Self = Self { shielded: false, direct: false };
-    pub const SHIELDED: Self = Self { shielded: true, direct: false };
-    pub const DIRECT: Self = Self { shielded: false, direct: true };
-    pub const BOTH: Self = Self { shielded: true, direct: true };
+    pub const NONE: Self = Self {
+        shielded: false,
+        direct: false,
+    };
+    pub const SHIELDED: Self = Self {
+        shielded: true,
+        direct: false,
+    };
+    pub const DIRECT: Self = Self {
+        shielded: false,
+        direct: true,
+    };
+    pub const BOTH: Self = Self {
+        shielded: true,
+        direct: true,
+    };
 
     /// No rail enabled → open, unbilled endpoint.
     pub fn is_empty(&self) -> bool {
