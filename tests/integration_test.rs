@@ -1020,6 +1020,191 @@ fn noop_provider_rejects_invalid_key() {
     assert!(result.is_err());
 }
 
+// ─── Direct-rail orchestration (authorize_request / settle_request) ───
+//
+// These exercise the SHARED pre-serve orchestration for the DirectTransfer
+// rail — the contract every blueprint depends on. The crypto itself is covered
+// by the anvil e2e below; this pins the fail-closed ORDERING and rail dispatch:
+//   - direct carries no pre-auth (it's already paid) and skips the spend_auth
+//     1.5x ceiling,
+//   - a failed verification is a 402,
+//   - an unhealthy backend is rejected BEFORE any payment is verified (so a
+//     buyer is never charged for a request the operator can't serve),
+//   - the per-account in-flight cap applies across rails by payer id,
+//   - settle is a no-op for direct.
+//
+// Composed from existing providers (no mock needed): NoopProvider always
+// authorizes; ShieldedProvider REJECTS a DirectTransfer proof — which also
+// sharpens the ordering proof (unhealthy must 503, never 402).
+
+fn direct_proof(from: &str) -> PaymentProof {
+    PaymentProof::DirectTransfer {
+        tx_hash: "0xfeed".into(),
+        from: from.into(),
+        amount: "1000".into(),
+        token: "0xToken".into(),
+    }
+}
+
+fn state_with_provider(provider: Arc<dyn PaymentProvider>, max_per_account: usize) -> AppState {
+    let billing =
+        BillingClient::new(&test_tangle_config(), &test_billing_config()).expect("billing client");
+    let operator = billing.operator_address();
+    let tmp = tempfile::tempdir().unwrap();
+    let nonce_path = tmp.path().join("nonces.json");
+    std::mem::forget(tmp);
+    AppStateBuilder::new()
+        .billing(Arc::new(billing))
+        .nonce_store(Arc::new(NonceStore::load(Some(nonce_path))))
+        .server_config(Arc::new(ServerConfig {
+            host: "127.0.0.1".into(),
+            port: 0,
+            max_concurrent_requests: 8,
+            max_request_body_bytes: 1024 * 1024,
+            stream_timeout_secs: 60,
+            idle_chunk_timeout_secs: 10,
+            max_line_buf_bytes: 64 * 1024,
+            max_per_account_requests: max_per_account,
+        }))
+        .billing_config(Arc::new(test_billing_config()))
+        .tangle_config(Arc::new(test_tangle_config()))
+        .operator_address(operator)
+        .max_concurrent(4)
+        .payment_provider(provider)
+        .backend(MockBackend {
+            name: "test".into(),
+            model: "test".into(),
+        })
+        .build()
+        .expect("build state")
+}
+
+fn noop_provider() -> Arc<dyn PaymentProvider> {
+    Arc::new(NoopProvider::new(TEST_OPERATOR_KEY.to_string()).unwrap())
+}
+
+fn shielded_provider() -> Arc<dyn PaymentProvider> {
+    Arc::new(
+        tangle_inference_core::payment::ShieldedProvider::new(
+            &test_tangle_config(),
+            &test_billing_config(),
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn direct_authorize_carries_no_preauth() {
+    use tangle_inference_core::server::authorize_request;
+    let state = state_with_provider(noop_provider(), 0);
+    let auth = authorize_request(
+        &state,
+        direct_proof("0xpayer"),
+        500,
+        std::future::ready(true),
+    )
+    .await
+    .expect("direct payment authorizes");
+    // Direct is already paid on-chain — there is no pre-auth to settle later.
+    assert!(auth.preauth.is_none());
+}
+
+#[tokio::test]
+async fn direct_skips_spend_auth_preauth_ceiling() {
+    use tangle_inference_core::server::authorize_request;
+    // The spend_auth rail caps pre-auth at 1.5x the estimate; direct has no
+    // pre-auth, so a tiny estimate must NOT reject a valid direct payment.
+    let state = state_with_provider(noop_provider(), 0);
+    let auth = authorize_request(&state, direct_proof("0xpayer"), 1, std::future::ready(true))
+        .await
+        .expect("tiny estimate must not block a direct payment");
+    assert!(auth.preauth.is_none());
+}
+
+#[tokio::test]
+async fn direct_failed_verification_is_402() {
+    use tangle_inference_core::server::authorize_request;
+    // ShieldedProvider rejects a DirectTransfer proof → verification fails.
+    let state = state_with_provider(shielded_provider(), 0);
+    let err = match authorize_request(
+        &state,
+        direct_proof("0xpayer"),
+        500,
+        std::future::ready(true),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("verification must fail"),
+    };
+    assert_eq!(err.status(), StatusCode::PAYMENT_REQUIRED);
+}
+
+#[tokio::test]
+async fn unhealthy_backend_rejected_before_payment_verification() {
+    use tangle_inference_core::server::authorize_request;
+    // Fail-closed ordering: a dead backend must 503 BEFORE payment is verified.
+    // ShieldedProvider would 402 a direct proof IF verification ran — so getting
+    // 503 (not 402) proves the health gate precedes the verify/commit step.
+    let state = state_with_provider(shielded_provider(), 0);
+    let err = match authorize_request(
+        &state,
+        direct_proof("0xpayer"),
+        500,
+        std::future::ready(false),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("unhealthy backend must be rejected"),
+    };
+    assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn direct_per_account_limit_applies_across_rails() {
+    use tangle_inference_core::server::authorize_request;
+    let state = state_with_provider(noop_provider(), 1);
+    // First request takes the only slot for this payer; hold the guard.
+    let _held = authorize_request(
+        &state,
+        direct_proof("0xpayer"),
+        500,
+        std::future::ready(true),
+    )
+    .await
+    .expect("first acquires the slot");
+    let err = match authorize_request(
+        &state,
+        direct_proof("0xpayer"),
+        500,
+        std::future::ready(true),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("second exceeds the per-account cap"),
+    };
+    assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn settle_request_is_noop_for_direct() {
+    use tangle_inference_core::server::{authorize_request, settle_request};
+    let state = state_with_provider(noop_provider(), 0);
+    let auth = authorize_request(
+        &state,
+        direct_proof("0xpayer"),
+        500,
+        std::future::ready(true),
+    )
+    .await
+    .expect("authorized");
+    // Direct is already paid: settle must not panic and has nothing to claim.
+    settle_request(&state, &auth, 250).await;
+    assert!(auth.preauth.is_none());
+}
+
 // ─── Real Anvil E2E: DirectProvider with real ERC-20 transfer ─────────
 //
 // Spawns Anvil, deploys a minimal ERC-20, mints tokens, does a real transfer
