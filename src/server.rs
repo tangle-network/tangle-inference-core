@@ -768,10 +768,8 @@ pub async fn payment_gate(
         Some(p)
     } else if let Some(sa) = body_spend_auth {
         Some(PaymentProof::SpendAuth(sa))
-    } else if let Some(sa) = extract_x402_spend_auth(headers) {
-        Some(PaymentProof::SpendAuth(sa))
     } else {
-        None
+        extract_x402_spend_auth(headers).map(PaymentProof::SpendAuth)
     };
 
     if billing_config.billing_required && proof.is_none() {
