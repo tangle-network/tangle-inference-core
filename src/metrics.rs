@@ -382,24 +382,30 @@ pub fn on_chain_metrics() -> Vec<(String, u64)> {
     let total = success + error + timeout;
     let latency_count = LATENCY_COUNT.load(Ordering::Relaxed);
     let latency_avg = if latency_count > 0 {
-        LATENCY_SUM_MS.load(Ordering::Relaxed) / latency_count
+        LATENCY_SUM_MS
+            .load(Ordering::Relaxed)
+            .checked_div(latency_count)
+            .unwrap_or(0)
     } else {
         0
     };
     let latency_max = LATENCY_MAX_MS.load(Ordering::Relaxed);
     let uptime_bps = if total > 0 {
-        (success * 10000) / total
+        (success * 10000).checked_div(total).unwrap_or(0)
     } else {
         10000
     };
     let error_rate_bps = if total > 0 {
-        ((error + timeout) * 10000) / total
+        ((error + timeout) * 10000).checked_div(total).unwrap_or(0)
     } else {
         0
     };
     let ttft_count = TTFT_COUNT.load(Ordering::Relaxed);
     let ttft_avg = if ttft_count > 0 {
-        TTFT_SUM_MS.load(Ordering::Relaxed) / ttft_count
+        TTFT_SUM_MS
+            .load(Ordering::Relaxed)
+            .checked_div(ttft_count)
+            .unwrap_or(0)
     } else {
         0
     };
@@ -451,9 +457,23 @@ pub fn health_summary() -> serde_json::Value {
             "timeout": timeout,
         },
         "latency": {
-            "avg_ms": if latency_count > 0 { LATENCY_SUM_MS.load(Ordering::Relaxed) / latency_count } else { 0 },
+            "avg_ms": if latency_count > 0 {
+                LATENCY_SUM_MS
+                    .load(Ordering::Relaxed)
+                    .checked_div(latency_count)
+                    .unwrap_or(0)
+            } else {
+                0
+            },
             "max_ms": LATENCY_MAX_MS.load(Ordering::Relaxed),
-            "ttft_avg_ms": if ttft_count > 0 { TTFT_SUM_MS.load(Ordering::Relaxed) / ttft_count } else { 0 },
+            "ttft_avg_ms": if ttft_count > 0 {
+                TTFT_SUM_MS
+                    .load(Ordering::Relaxed)
+                    .checked_div(ttft_count)
+                    .unwrap_or(0)
+            } else {
+                0
+            },
         },
         "throughput": {
             "tokens_generated": TOKENS_GENERATED.load(Ordering::Relaxed),
