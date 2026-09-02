@@ -555,6 +555,7 @@ pub fn extract_x402_spend_auth(headers: &HeaderMap) -> Option<SpendAuthPayload> 
 /// Checks: amount parsing, min charge, max spend, operator address match,
 /// service ID match, nonce replay. Returns an error response on any failure,
 /// or Ok(parsed_amount) on success.
+#[allow(clippy::result_large_err)]
 pub async fn validate_spend_auth(
     state: &AppState,
     spend_auth: &SpendAuthPayload,
@@ -812,6 +813,7 @@ pub async fn settle_payment(
 /// the spend on-chain. Returns `(spend_auth, preauth_amount)` on success.
 ///
 /// Callers settle after serving via [`settle_billing`].
+#[allow(clippy::result_large_err)]
 pub async fn billing_gate(
     state: &AppState,
     headers: &HeaderMap,
@@ -959,6 +961,7 @@ pub fn resolve_payment_proof(
 /// `is_healthy` is the backend readiness check, polled only after validation.
 /// Returns the authorization to carry into [`settle_request`], or the 4xx
 /// `Response` to hand back.
+#[allow(clippy::result_large_err)]
 pub async fn authorize_request(
     state: &AppState,
     proof: PaymentProof,
