@@ -756,6 +756,7 @@ pub fn acquire_permit(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePer
 /// provider's `authorize()`, returns the proof + authorized amount.
 ///
 /// New blueprints should use this instead of `billing_gate`.
+#[allow(clippy::result_large_err)]
 pub async fn payment_gate(
     provider: &dyn PaymentProvider,
     billing_config: &BillingConfig,
