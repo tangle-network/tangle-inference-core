@@ -151,7 +151,7 @@ pub struct BillingConfig {
     #[serde(default)]
     pub min_charge_amount: u64,
 
-    /// Maximum retries for claim_payment on-chain calls.
+    /// Maximum retries for on-chain settlement calls (settlePayment / claimPayment).
     #[serde(default = "default_claim_max_retries")]
     pub claim_max_retries: u32,
 

@@ -249,7 +249,7 @@ pub async fn chat_completions(
                 &state.billing,
                 &spend_auth,
                 /*preauth=*/ spend_auth.amount,
-                /*actual=*/ cost,
+                /*actual=*/ Some(cost), // None falls back to full-pre-auth claimPayment
             ).await;
 
             Json(response).into_response()
