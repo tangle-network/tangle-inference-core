@@ -41,13 +41,16 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, Json(req): Json
     // Run inference
     let result = backend.generate(&req).await;
 
-    // Settle on-chain (authorizeSpend + claimPayment)
+    // Settle on-chain (authorizeSpend before serving, settlePayment after —
+    // the contract charges the metered cost and refunds the unused pre-auth;
+    // pass None instead of Some(cost) when usage metering is unavailable to
+    // fall back to a full-pre-auth claimPayment)
     let cost = my_cost_model.calculate_cost(&CostParams {
         prompt_tokens: result.prompt_tokens,
         completion_tokens: result.completion_tokens,
         ..Default::default()
     });
-    settle_billing(&state.billing, &spend_auth, preauth, cost).await;
+    settle_billing(&state.billing, &spend_auth, preauth, Some(cost)).await;
 
     Json(result).into_response()
 }
@@ -57,7 +60,7 @@ async fn chat(State(state): State<AppState>, headers: HeaderMap, Json(req): Json
 
 | Module | What it does |
 |--------|-------------|
-| **`billing`** | `BillingClient` — submits `authorizeSpend` and `claimPayment` txs to ShieldedCredits via alloy. EIP-712 signature recovery. Gas price cap. Retry with exponential backoff. |
+| **`billing`** | `BillingClient` — submits `authorizeSpend` and settlement (`settlePayment` metered / `claimPayment` full pre-auth fallback) txs to ShieldedCredits via alloy. EIP-712 signature recovery. Gas price cap. Retry with exponential backoff. |
 | **`server`** | `AppState` + builder, `NonceStore` (file-backed replay protection), `validate_spend_auth`, `settle_billing`, `extract_x402_spend_auth`, `payment_required`, `error_response` |
 | **`metrics`** | Global Prometheus registry. `RequestGuard` RAII — tracks latency, tokens, TTFT, active requests. `on_chain_metrics()` for QoS heartbeat. |
 | **`health`** | `detect_gpus()` — parses `nvidia-smi`, returns `Vec<GpuInfo>` |

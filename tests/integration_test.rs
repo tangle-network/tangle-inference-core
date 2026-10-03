@@ -1201,8 +1201,65 @@ async fn settle_request_is_noop_for_direct() {
     .await
     .expect("authorized");
     // Direct is already paid: settle must not panic and has nothing to claim.
-    settle_request(&state, &auth, 250).await;
+    settle_request(&state, &auth, Some(250)).await;
     assert!(auth.preauth.is_none());
+}
+
+// ─── Metered settlement dispatch (plan_settlement) ──────────────────────
+//
+// Pins the post-serve settlement semantics the billing gate dispatches on:
+//   - actual < cap → settlePayment(actual): operator receives actual, the
+//     contract refunds cap − actual to the user's credit account,
+//   - actual == cap → settlePayment(cap): no refund,
+//   - actual > cap → settlePayment(cap): charge is capped at the pre-auth,
+//   - metering unavailable (None) → claimPayment(full pre-auth): the original
+//     behavior, unchanged,
+//   - zero charge → no on-chain settlement at all.
+// The on-chain refund mechanics themselves are proven by the forge suite
+// (BillingE2E.t.sol in llm-inference-blueprint).
+
+use tangle_inference_core::server::{plan_settlement, SettlementPlan};
+
+#[test]
+fn plan_settlement_metered_below_cap_charges_actual() {
+    assert_eq!(
+        plan_settlement(1000, Some(20)),
+        SettlementPlan::Metered(20),
+        "actual < cap: operator receives actual; cap - actual is refunded on-chain"
+    );
+}
+
+#[test]
+fn plan_settlement_metered_at_cap_charges_full() {
+    assert_eq!(
+        plan_settlement(1000, Some(1000)),
+        SettlementPlan::Metered(1000),
+        "actual == cap: full charge, no refund"
+    );
+}
+
+#[test]
+fn plan_settlement_metered_above_cap_is_capped() {
+    assert_eq!(
+        plan_settlement(100, Some(1100)),
+        SettlementPlan::Metered(100),
+        "actual > cap: charge must be capped at the pre-authorized amount"
+    );
+}
+
+#[test]
+fn plan_settlement_unmetered_falls_back_to_full_preauth_claim() {
+    assert_eq!(
+        plan_settlement(1000, None),
+        SettlementPlan::FullPreAuth(1000),
+        "metering unavailable: claimPayment(full pre-auth) — behavior unchanged"
+    );
+}
+
+#[test]
+fn plan_settlement_zero_charge_skips_on_chain_settlement() {
+    assert_eq!(plan_settlement(500, Some(0)), SettlementPlan::Skip);
+    assert_eq!(plan_settlement(0, None), SettlementPlan::Skip);
 }
 
 // ─── Real Anvil E2E: DirectProvider with real ERC-20 transfer ─────────

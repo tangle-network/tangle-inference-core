@@ -2,7 +2,7 @@
 //!
 //! Decouples inference billing from any specific payment mechanism.
 //! Two implementations:
-//!   - `ShieldedProvider` — existing ShieldedCredits flow (authorize → serve → claim)
+//!   - `ShieldedProvider` — existing ShieldedCredits flow (authorize → serve → settle)
 //!   - `DirectProvider` — verify an ERC-20 transfer on-chain (no shielded pool)
 //!
 //! Blueprints use `PaymentProvider` trait; config selects the implementation.
@@ -59,7 +59,9 @@ pub trait PaymentProvider: Send + Sync + 'static {
     async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64>;
 
     /// Settle payment after inference is served.
-    /// `actual_cost` may be less than the authorized amount.
+    /// `actual_cost` may be less than the authorized amount; the shielded rail
+    /// settles only the actual amount via `settlePayment` (the contract refunds
+    /// the unused pre-auth to the user's credit account).
     async fn settle(&self, proof: &PaymentProof, actual_cost: u64) -> anyhow::Result<()>;
 
     /// Operator's on-chain address.
@@ -104,7 +106,7 @@ impl PaymentProvider for ShieldedProvider {
         let PaymentProof::SpendAuth(spend_auth) = proof else {
             anyhow::bail!("ShieldedProvider requires SpendAuth proof for settlement");
         };
-        self.client.claim_payment(spend_auth, actual_cost).await
+        self.client.settle_payment(spend_auth, actual_cost).await
     }
 
     fn operator_address(&self) -> Address {

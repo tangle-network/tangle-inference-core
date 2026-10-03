@@ -851,19 +851,64 @@ pub async fn billing_gate(
     Ok((Some(spend_auth), Some(preauth_amount)))
 }
 
-/// Settle billing after successful inference. Calculates the actual cost,
-/// caps at pre-authorized amount, and claims payment on-chain.
+/// How a post-serve settlement should be executed on-chain. Factored out of
+/// [`settle_billing_with_recovery`] so the dispatch decision is unit-testable
+/// without a chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettlementPlan {
+    /// Usage metering available: call `settlePayment` with this amount. The
+    /// operator receives exactly this and the contract refunds the unused
+    /// pre-auth (`pre-auth − amount`) to the user's credit account.
+    Metered(u64),
+    /// Usage metering unavailable (e.g. streaming backend ended without a
+    /// usage chunk): call `claimPayment`, settling the full pre-auth — the
+    /// original settlement behavior.
+    FullPreAuth(u64),
+    /// Zero charge: nothing to settle on-chain.
+    Skip,
+}
+
+/// Decide how to settle a served request. `actual_cost = Some(_)` is the
+/// metered cost from real usage (capped at the pre-auth); `None` means usage
+/// metering was unavailable and the full pre-auth is claimed.
+pub fn plan_settlement(preauth_amount: u64, actual_cost: Option<u64>) -> SettlementPlan {
+    match actual_cost {
+        Some(cost) => {
+            let charge = cost.min(preauth_amount);
+            if charge == 0 {
+                SettlementPlan::Skip
+            } else {
+                SettlementPlan::Metered(charge)
+            }
+        }
+        None => {
+            if preauth_amount == 0 {
+                SettlementPlan::Skip
+            } else {
+                SettlementPlan::FullPreAuth(preauth_amount)
+            }
+        }
+    }
+}
+
+/// Settle billing after successful inference.
 ///
-/// If `claim_payment` fails after all retries and a recovery queue is
+/// When `actual_cost` is `Some`, the metered amount (capped at the pre-auth)
+/// is settled via `settlePayment` and the contract refunds the unused pre-auth
+/// to the user. When `actual_cost` is `None` — usage metering unavailable, see
+/// [`plan_settlement`] — the full pre-auth is claimed via `claimPayment`,
+/// unchanged from the original behavior.
+///
+/// If the on-chain settlement fails after all retries and a recovery queue is
 /// provided, the failed settlement is persisted for later retry.
 ///
-/// Returns an error if `claim_payment` fails after all retries so callers
+/// Returns an error if the settlement fails after all retries so callers
 /// can log / alert appropriately.
 pub async fn settle_billing(
     billing: &BillingClient,
     spend_auth: &SpendAuthPayload,
     preauth_amount: u64,
-    actual_cost: u64,
+    actual_cost: Option<u64>,
 ) -> Result<(), anyhow::Error> {
     settle_billing_with_recovery(billing, spend_auth, preauth_amount, actual_cost, None).await
 }
@@ -874,42 +919,45 @@ pub async fn settle_billing_with_recovery(
     billing: &BillingClient,
     spend_auth: &SpendAuthPayload,
     preauth_amount: u64,
-    actual_cost: u64,
+    actual_cost: Option<u64>,
     recovery_queue: Option<&SettlementRecoveryQueue>,
 ) -> Result<(), anyhow::Error> {
-    let charge_amount = actual_cost.min(preauth_amount);
+    let plan = plan_settlement(preauth_amount, actual_cost);
 
-    tracing::info!(
-        actual_cost,
-        preauth_amount,
-        charge_amount,
-        "settling billing (contract settles full pre-auth)"
-    );
+    tracing::info!(actual_cost, preauth_amount, ?plan, "settling billing");
 
-    if charge_amount > 0 {
-        if let Err(e) = billing.claim_payment(spend_auth, charge_amount).await {
-            if let Some(queue) = recovery_queue {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                queue.enqueue(FailedSettlement {
-                    commitment: spend_auth.commitment.clone(),
-                    nonce: spend_auth.nonce,
-                    amount: charge_amount.to_string(),
-                    operator: spend_auth.operator.clone(),
-                    service_id: spend_auth.service_id,
-                    timestamp: now,
-                    error: format!("{e}"),
-                    retry_count: 0,
-                });
-                tracing::error!(
-                    error = %e,
-                    "claimPayment failed — enqueued to dead-letter queue for retry"
-                );
-            }
-            return Err(e);
+    let (charge_amount, result) = match plan {
+        SettlementPlan::Metered(charge) => {
+            (charge, billing.settle_payment(spend_auth, charge).await)
         }
+        SettlementPlan::FullPreAuth(charge) => {
+            (charge, billing.claim_payment(spend_auth, charge).await)
+        }
+        SettlementPlan::Skip => return Ok(()),
+    };
+
+    if let Err(e) = result {
+        if let Some(queue) = recovery_queue {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            queue.enqueue(FailedSettlement {
+                commitment: spend_auth.commitment.clone(),
+                nonce: spend_auth.nonce,
+                amount: charge_amount.to_string(),
+                operator: spend_auth.operator.clone(),
+                service_id: spend_auth.service_id,
+                timestamp: now,
+                error: format!("{e}"),
+                retry_count: 0,
+            });
+            tracing::error!(
+                error = %e,
+                "settlement failed — enqueued to dead-letter queue for retry"
+            );
+        }
+        return Err(e);
     }
 
     Ok(())
@@ -954,8 +1002,8 @@ pub fn resolve_payment_proof(
 /// over-limit request gets a precise 4xx (not a backend-health 503) and the
 /// operator never commits gas / verifies payment for a backend it can't serve.
 ///   - **SpendAuth**: validate (sig / nonce / amount / operator) + pre-auth
-///     ceiling (≤ 1.5× estimated, since the contract claims the full pre-auth),
-///     then on-chain `authorizeSpend`.
+///     ceiling (≤ 1.5× estimated, so a request can't lock up far more credit
+///     than it can plausibly consume), then on-chain `authorizeSpend`.
 ///   - **DirectTransfer**: verify the on-chain transfer via the payment provider
 ///     (already paid; nothing to pre-authorize).
 ///
@@ -996,15 +1044,17 @@ pub async fn authorize_request(
     let preauth = match &proof {
         PaymentProof::SpendAuth(spend_auth) => {
             let preauth = validate_spend_auth(state, spend_auth).await?;
-            // The contract claims the FULL pre-auth, so reject an authorization
-            // that exceeds 1.5× the estimated max cost (overcharge protection).
+            // Reject an authorization that exceeds 1.5× the estimated max cost
+            // so a request can't lock up far more credit than it can plausibly
+            // consume (settlement itself is metered — the unused pre-auth is
+            // refunded by `settlePayment`).
             let ceiling = estimated_max_cost.saturating_mul(3) / 2;
             if estimated_max_cost > 0 && preauth > ceiling {
                 return Err(error_response(
                     StatusCode::BAD_REQUEST,
                     format!(
                         "pre-auth amount ({preauth}) exceeds 1.5x estimated max cost \
-                         ({estimated_max_cost}) — reduce amount to avoid overcharging"
+                         ({estimated_max_cost}) — reduce amount to avoid locking excess credit"
                     ),
                     "billing_error",
                     "excessive_preauth",
@@ -1057,11 +1107,14 @@ pub async fn authorize_request(
     })
 }
 
-/// Settle a request's payment after serving, dispatched by rail. Shielded claims
-/// up to the pre-auth (with dead-letter recovery on failure); direct is already
-/// paid (no-op). Errors are logged, not propagated — a settlement failure must
-/// not fail the already-served response.
-pub async fn settle_request(state: &AppState, auth: &AuthorizedPayment, actual_cost: u64) {
+/// Settle a request's payment after serving, dispatched by rail. Shielded
+/// settles the metered amount via `settlePayment` when `actual_cost` is known
+/// (the contract refunds the unused pre-auth), or claims the full pre-auth via
+/// `claimPayment` when usage metering is unavailable (e.g. a streaming backend
+/// that ended without a usage chunk). Direct is already paid (no-op). Both go
+/// through dead-letter recovery on failure. Errors are logged, not propagated —
+/// a settlement failure must not fail the already-served response.
+pub async fn settle_request(state: &AppState, auth: &AuthorizedPayment, actual_cost: Option<u64>) {
     if let PaymentProof::SpendAuth(ref spend_auth) = auth.proof {
         if let Some(preauth) = auth.preauth {
             if let Err(e) = settle_billing_with_recovery(

@@ -135,6 +135,7 @@ sol! {
 
         function authorizeSpend(SpendAuth calldata auth) external returns (bytes32 authHash);
         function claimPayment(bytes32 authHash, address recipient) external;
+        function settlePayment(bytes32 authHash, address recipient, uint256 amount) external;
         function getAccount(bytes32 commitment) external view returns (
             address spendingKey,
             address token,
@@ -332,7 +333,11 @@ impl BillingClient {
     /// Claim payment on-chain after inference is served.
     ///
     /// The ShieldedCredits contract `claimPayment(bytes32, address)` settles the
-    /// full pre-authorized amount. `actual_amount` is logged for auditing only.
+    /// full pre-authorized amount. This is the fallback for requests where usage
+    /// metering is unavailable (e.g. a streaming backend that ended without a
+    /// usage chunk) — prefer [`Self::settle_payment`] when the actual metered
+    /// cost is known so the unused pre-auth is refunded to the user.
+    /// `actual_amount` is logged for auditing only.
     ///
     /// Retries up to `claim_max_retries` times with exponential backoff.
     pub async fn claim_payment(
@@ -340,14 +345,52 @@ impl BillingClient {
         spend_auth: &SpendAuthPayload,
         actual_amount: u64,
     ) -> anyhow::Result<()> {
+        self.settle_on_chain(spend_auth, None, actual_amount).await
+    }
+
+    /// Settle payment on-chain after inference is served, charging only the
+    /// actual metered amount.
+    ///
+    /// Calls the ShieldedCredits `settlePayment(authHash, recipient, amount)`:
+    /// the recipient receives exactly `actual_amount` and the contract refunds
+    /// the unused pre-auth (`pre-auth − actual_amount`) to the credit account in
+    /// the same transaction. Requires a ShieldedCredits deployment that exposes
+    /// `settlePayment` (deployed and proven on Base Sepolia); `actual_amount`
+    /// must not exceed the pre-authorized amount or the call reverts.
+    ///
+    /// Retries up to `claim_max_retries` times with exponential backoff.
+    pub async fn settle_payment(
+        &self,
+        spend_auth: &SpendAuthPayload,
+        actual_amount: u64,
+    ) -> anyhow::Result<()> {
+        self.settle_on_chain(spend_auth, Some(actual_amount), actual_amount)
+            .await
+    }
+
+    /// Shared settlement path for [`Self::claim_payment`] and
+    /// [`Self::settle_payment`]. `metered_amount = Some(_)` sends the metered
+    /// `settlePayment`; `None` sends the full-pre-auth `claimPayment`.
+    /// `audit_amount` is the operator-computed cost, logged for auditing.
+    async fn settle_on_chain(
+        &self,
+        spend_auth: &SpendAuthPayload,
+        metered_amount: Option<u64>,
+        audit_amount: u64,
+    ) -> anyhow::Result<()> {
         let auth_hash = Self::auth_hash(spend_auth)?;
         let operator: Address = spend_auth.operator.parse()?;
         let max_retries = self.claim_max_retries;
+        let op_label = if metered_amount.is_some() {
+            "settlePayment"
+        } else {
+            "claimPayment"
+        };
 
         tracing::info!(
-            actual_amount = actual_amount,
+            actual_amount = audit_amount,
             preauth_amount = %spend_auth.amount,
-            "claiming payment (actual metered cost)"
+            "settling payment on-chain via {op_label}"
         );
 
         let mut last_err = None;
@@ -358,7 +401,7 @@ impl BillingClient {
                 tracing::warn!(
                     attempt,
                     delay_ms = delay.as_millis() as u64,
-                    "retrying claimPayment"
+                    "retrying {op_label}"
                 );
                 tokio::time::sleep(delay).await;
             }
@@ -366,7 +409,7 @@ impl BillingClient {
             // Check gas price — if too high, skip this attempt (loop will
             // backoff on the next iteration via the block above).
             if let Err(e) = self.check_gas_price().await {
-                tracing::warn!(error = %e, attempt, "gas price check failed for claimPayment");
+                tracing::warn!(error = %e, attempt, "gas price check failed for {op_label}");
                 last_err = Some(e);
                 continue;
             }
@@ -377,14 +420,24 @@ impl BillingClient {
 
             let contract = IShieldedCredits::new(self.shielded_credits, &provider);
 
-            match contract.claimPayment(auth_hash, operator).send().await {
+            let send_result = match metered_amount {
+                Some(amount) => {
+                    contract
+                        .settlePayment(auth_hash, operator, U256::from(amount))
+                        .send()
+                        .await
+                }
+                None => contract.claimPayment(auth_hash, operator).send().await,
+            };
+
+            match send_result {
                 Ok(pending) => match pending.get_receipt().await {
                     Ok(receipt) => {
                         tracing::info!(
                             tx_hash = %receipt.transaction_hash,
-                            actual_amount = actual_amount,
+                            actual_amount = audit_amount,
                             attempt,
-                            "claimPayment confirmed"
+                            "{op_label} confirmed"
                         );
                         return Ok(());
                     }
@@ -398,13 +451,13 @@ impl BillingClient {
             }
         }
 
-        let err = last_err.unwrap_or_else(|| anyhow::anyhow!("claimPayment failed"));
+        let err = last_err.unwrap_or_else(|| anyhow::anyhow!("{op_label} failed"));
         tracing::error!(
             error = %err,
             auth_hash = %auth_hash,
-            actual_amount,
+            actual_amount = audit_amount,
             commitment = %spend_auth.commitment,
-            "claimPayment FAILED after {} retries — operator served inference for free. Manual recovery required.",
+            "{op_label} FAILED after {} retries — operator served inference for free. Manual recovery required.",
             max_retries
         );
         Err(err)
