@@ -10,7 +10,7 @@ env:
 
 jobs:
   check:
-    runs-on: [self-hosted, ci-public]
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         features: ["", "--no-default-features", "--features billing", "--features http,billing", "--features metrics"]
@@ -21,7 +21,7 @@ jobs:
       - run: cargo check ${{ matrix.features }}
 
   test:
-    runs-on: [self-hosted, ci-public]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,7 +29,7 @@ jobs:
       - run: cargo test --all-features
 
   clippy:
-    runs-on: [self-hosted, ci-public]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -39,7 +39,7 @@ jobs:
       - run: cargo clippy --all-features --all-targets -- -D warnings
 
   fmt:
-    runs-on: [self-hosted, ci-public]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
