@@ -132,9 +132,13 @@ let vllm: &VllmProcess = state.backend::<VllmProcess>().unwrap();
 
 ## Testing
 
+Local qualification runs through the admitted Beelink gate. Its frozen Cargo resolution retains all five feature-check configurations and the existing full test, Clippy and formatting populations:
+
 ```bash
-cargo test
+beelink-gate auto https://github.com/tangle-network/tangle-inference-core.git "$(git rev-parse HEAD)" -- sh -c 'cargo +stable fetch --locked && cargo +stable fmt -- --check && cargo +stable check --locked && cargo +stable check --locked --no-default-features && cargo +stable check --locked --features billing && cargo +stable check --locked --features http,billing && cargo +stable check --locked --features metrics && cargo +stable test --locked --all-features && cargo +stable clippy --locked --all-features --all-targets -- -D warnings'
 ```
+
+Run these checks on the admitted host before merging. This library has no PR or push CI gate; downstream applications retain their own release qualification.
 
 Integration tests construct a real `AppState`, exercise every `CostModel`, sign a `SpendAuthPayload` with a known keypair, round-trip it through EIP-712 recovery, and verify `NonceStore` persistence across reloads.
 
