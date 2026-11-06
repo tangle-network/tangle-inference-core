@@ -32,10 +32,7 @@ fn catalog_exports_real_family_recipes_and_sglang_argv() -> anyhow::Result<()> {
     assert_eq!(option(&glm.args, "--model-path"), "acme/derived-glm");
     assert_eq!(option(&glm.args, "--tp"), "8");
     let deepseek = catalog.resolve("deepseek-v4.1-flash-1017", None)?;
-    assert_eq!(
-        option(&deepseek.args, "--moe-runner-backend"),
-        "flashinfer_mxfp4"
-    );
+    assert_eq!(option(&deepseek.args, "--moe-runner-backend"), "marlin");
     assert_eq!(option(&deepseek.args, "--attention-backend"), "dsv4");
     assert_eq!(option(&deepseek.args, "--ep-size"), "1");
     assert_eq!(
