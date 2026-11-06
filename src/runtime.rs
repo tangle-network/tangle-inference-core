@@ -40,47 +40,56 @@ pub async fn operator_executable_sha256() -> Option<String> {
         .clone()
 }
 
-/// Observe only the owned child; arguments are hashed as raw NUL-separated
-/// process bytes, never returned or logged as plaintext.
-pub async fn child_identity(child: &Child) -> ChildIdentity {
+/// Open the owned child's process files before asynchronous hashing.
+/// Arguments are hashed as raw NUL-separated bytes; no plaintext leaves here.
+pub fn child_identity(child: &Child) -> impl std::future::Future<Output = ChildIdentity> + use<> {
     let pid = child.id();
-    let (executable_sha256, argv_sha256) = match pid {
-        Some(pid) => (
-            file_sha256(PathBuf::from(format!("/proc/{pid}/exe"))).await,
-            file_sha256(PathBuf::from(format!("/proc/{pid}/cmdline"))).await,
-        ),
-        None => (None, None),
-    };
-    ChildIdentity {
-        pid,
-        executable_sha256,
-        argv_sha256,
+    let files = pid.map(|pid| {
+        (
+            file_sha256(PathBuf::from(format!("/proc/{pid}/exe"))),
+            file_sha256(PathBuf::from(format!("/proc/{pid}/cmdline"))),
+        )
+    });
+    async move {
+        let (executable_sha256, argv_sha256) = match files {
+            Some((executable, argv)) => (executable.await, argv.await),
+            None => (None, None),
+        };
+        ChildIdentity {
+            pid,
+            executable_sha256,
+            argv_sha256,
+        }
     }
 }
 
-async fn file_sha256(path: PathBuf) -> Option<String> {
+fn file_sha256(path: PathBuf) -> impl std::future::Future<Output = Option<String>> + use<> {
     #[cfg(target_os = "linux")]
-    {
-        tokio::task::spawn_blocking(move || {
-            let mut file = File::open(path).ok()?;
-            let mut digest = Sha256::new();
-            let mut buffer = vec![0; 64 * 1024];
-            loop {
-                let count = file.read(&mut buffer).ok()?;
-                if count == 0 {
-                    break;
+    let file = File::open(path);
+    async move {
+        #[cfg(target_os = "linux")]
+        {
+            tokio::task::spawn_blocking(move || {
+                let mut file = file.ok()?;
+                let mut digest = Sha256::new();
+                let mut buffer = vec![0; 64 * 1024];
+                loop {
+                    let count = file.read(&mut buffer).ok()?;
+                    if count == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..count]);
                 }
-                digest.update(&buffer[..count]);
-            }
-            Some(format!("{:x}", digest.finalize()))
-        })
-        .await
-        .ok()
-        .flatten()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = path;
-        None
+                Some(format!("{:x}", digest.finalize()))
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            None
+        }
     }
 }

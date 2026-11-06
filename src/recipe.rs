@@ -105,10 +105,6 @@ pub struct ResolvedRecipe {
 }
 
 impl RecipeCatalog {
-    pub fn source_sha256(&self) -> &str {
-        &self.source_sha256
-    }
-
     pub fn bundled() -> Result<Self> {
         Self::from_json(ENGINE_PROFILES)
     }
@@ -253,7 +249,7 @@ impl RecipeCatalog {
             set_option(&mut args, &["--revision"], "--revision", revision);
         }
         Ok(ResolvedRecipe {
-            catalog_sha256: self.source_sha256().to_owned(),
+            catalog_sha256: self.source_sha256.clone(),
             image: self.image.clone(),
             family: family.into(),
             arm: arm.into(),

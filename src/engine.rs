@@ -560,17 +560,17 @@ impl EngineProcess {
     /// Observed process facts are distinct from the declared recipe and image.
     pub async fn runtime_info(&self) -> Result<serde_json::Value> {
         use sha2::{Digest, Sha256};
-        let processes = {
-            let children = self
-                .children
-                .try_lock()
-                .context("engine runtime is changing")?;
-            let mut observed = Vec::with_capacity(children.len());
-            for child in children.iter() {
-                observed.push(crate::runtime::child_identity(&child.child).await);
-            }
-            observed
-        };
+        let observations = self
+            .children
+            .lock()
+            .await
+            .iter()
+            .map(|child| crate::runtime::child_identity(&child.child))
+            .collect::<Vec<_>>();
+        let mut processes = Vec::with_capacity(observations.len());
+        for observation in observations {
+            processes.push(observation.await);
+        }
         let ready = self.is_healthy().await;
         let models = if ready {
             self.observed_json("/v1/models").await.and_then(|value| {
@@ -624,10 +624,7 @@ impl EngineProcess {
                 "replicas": self.config.replicas, "model": recipe.model, "revision": recipe.revision,
             })),
         });
-        let mut current = self
-            .children
-            .try_lock()
-            .context("engine runtime is changing")?;
+        let mut current = self.children.lock().await;
         ensure!(
             current
                 .iter()
@@ -666,9 +663,7 @@ impl EngineProcess {
 
     pub async fn is_healthy(&self) -> bool {
         let urls = if self.managed {
-            let Ok(mut children) = self.children.try_lock() else {
-                return false;
-            };
+            let mut children = self.children.lock().await;
             if children.is_empty()
                 || children
                     .iter_mut()
@@ -737,7 +732,8 @@ impl EngineProcess {
         self.stopped.store(true, Ordering::Release);
         self.cancel_start
             .send_modify(|generation| *generation = generation.wrapping_add(1));
-        let mut children = self.children.lock().await;
+        let _launch = self.launch.lock().await;
+        let mut children = std::mem::take(&mut *self.children.lock().await);
         while let Some(mut child) = children.pop() {
             child.terminate().await;
         }
