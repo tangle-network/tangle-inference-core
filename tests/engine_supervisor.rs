@@ -209,8 +209,9 @@ async fn child_environment_is_allowlisted() -> anyhow::Result<()> {
             .await?;
         assert!(
             result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stdout)
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
         );
         return Ok(());
     }
@@ -275,8 +276,9 @@ async fn replica_set_owns_workers_router_and_device_partitions() -> anyhow::Resu
             .await?;
         anyhow::ensure!(
             output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
         return Ok(());
     }
