@@ -2,6 +2,7 @@ pub mod config;
 pub mod engine;
 pub mod health;
 pub mod operator;
+pub mod recipe;
 pub mod settlement_queue;
 
 #[cfg(all(feature = "billing", feature = "metrics"))]
@@ -15,6 +16,8 @@ pub mod metrics;
 pub mod payment;
 #[cfg(all(feature = "http", feature = "billing"))]
 pub mod server;
+#[cfg(all(feature = "http", feature = "billing"))]
+pub mod state;
 
 // Re-exports — gated by feature
 #[cfg(feature = "billing")]

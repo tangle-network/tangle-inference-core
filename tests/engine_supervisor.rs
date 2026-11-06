@@ -177,3 +177,56 @@ async fn startup_failure_is_bounded_and_external_restart_is_refused() -> anyhow:
     assert!(external.restart().await.is_err());
     Ok(())
 }
+
+#[tokio::test]
+async fn child_environment_is_allowlisted() -> anyhow::Result<()> {
+    if std::env::var_os("TANGLE_ENGINE_ENV_PROBE").is_none() {
+        let result = tokio::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "child_environment_is_allowlisted", "--nocapture"])
+            .env("TANGLE_ENGINE_ENV_PROBE", "1")
+            .env("TANGLE_PARENT_ONLY_TEST", "fixture-value")
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let output = dir.path().join("environment.json");
+    let peer = dir.path().join("engine.py");
+    std::fs::write(
+        &peer,
+        r#"import json, os, sys
+with open(sys.argv[1], 'w') as output:
+    json.dump({'leaked': os.environ.get('TANGLE_PARENT_ONLY_TEST') == 'fixture-value', 'path': bool(os.environ.get('PATH'))}, output)
+"#,
+    )?;
+    let mut cfg = config(EngineKind::Vllm);
+    cfg.command = format!("python3 {} {}", peer.display(), output.display());
+    let process = EngineProcess::spawn(cfg).await?;
+    let result: serde_json::Value = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(&output) {
+                if let Ok(value) = serde_json::from_slice(&bytes) {
+                    break value;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    process.shutdown().await;
+    assert_eq!(
+        result["leaked"], false,
+        "parent-only environment crossed the child boundary"
+    );
+    assert_eq!(
+        result["path"], true,
+        "approved executable search path was lost"
+    );
+    Ok(())
+}
