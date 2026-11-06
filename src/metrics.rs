@@ -10,103 +10,110 @@ use prometheus::{
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::default);
 static STARTED_AT: LazyLock<Instant> = LazyLock::new(Instant::now);
 
+fn registered<C: prometheus::core::Collector + Clone + 'static>(metric: C) -> C {
+    REGISTRY
+        .register(Box::new(metric.clone()))
+        .expect("register");
+    metric
+}
+
 pub static REQUEST_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new("tangle_operator_requests_total", "Total inference requests"),
-        &["model", "status"],
+    registered(
+        IntCounterVec::new(
+            Opts::new("tangle_operator_requests_total", "Total inference requests"),
+            &["model", "status"],
+        )
+        .expect("metric"),
     )
-    .expect("metric");
-    REGISTRY.register(Box::new(c.clone())).expect("register");
-    c
 });
 
 pub static REQUEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
-    let h = HistogramVec::new(
-        HistogramOpts::new(
-            "tangle_operator_request_duration_ms",
-            "End-to-end request duration in ms",
+    registered(
+        HistogramVec::new(
+            HistogramOpts::new(
+                "tangle_operator_request_duration_ms",
+                "End-to-end request duration in ms",
+            )
+            .buckets(vec![
+                10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0,
+            ]),
+            &["model"],
         )
-        .buckets(vec![
-            10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0,
-        ]),
-        &["model"],
+        .expect("metric"),
     )
-    .expect("metric");
-    REGISTRY.register(Box::new(h.clone())).expect("register");
-    h
 });
 
 pub static ACTIVE_REQUESTS: LazyLock<Gauge> = LazyLock::new(|| {
-    let g = Gauge::new(
-        "tangle_operator_active_requests",
-        "Currently processing requests",
+    registered(
+        Gauge::new(
+            "tangle_operator_active_requests",
+            "Currently processing requests",
+        )
+        .expect("metric"),
     )
-    .expect("metric");
-    REGISTRY.register(Box::new(g.clone())).expect("register");
-    g
 });
 
 pub static MAX_CONCURRENT_REQUESTS: LazyLock<Gauge> = LazyLock::new(|| {
-    let g = Gauge::new(
-        "tangle_operator_max_concurrent",
-        "Peak concurrent requests observed",
+    registered(
+        Gauge::new(
+            "tangle_operator_max_concurrent",
+            "Peak concurrent requests observed",
+        )
+        .expect("metric"),
     )
-    .expect("metric");
-    REGISTRY.register(Box::new(g.clone())).expect("register");
-    g
 });
 
 pub static TOKENS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new("tangle_operator_tokens_total", "LLM tokens processed"),
-        &["model", "type"],
+    registered(
+        IntCounterVec::new(
+            Opts::new("tangle_operator_tokens_total", "LLM tokens processed"),
+            &["model", "type"],
+        )
+        .expect("metric"),
     )
-    .expect("metric");
-    REGISTRY.register(Box::new(c.clone())).expect("register");
-    c
 });
 
 pub static TOKENS_PER_SECOND: LazyLock<GaugeVec> = LazyLock::new(|| {
-    let g = GaugeVec::new(
-        Opts::new(
-            "tangle_operator_tokens_per_second",
-            "Output token generation rate (last request)",
-        ),
-        &["model"],
+    registered(
+        GaugeVec::new(
+            Opts::new(
+                "tangle_operator_tokens_per_second",
+                "Output token generation rate (last request)",
+            ),
+            &["model"],
+        )
+        .expect("metric"),
     )
-    .expect("metric");
-    REGISTRY.register(Box::new(g.clone())).expect("register");
-    g
 });
 
 pub static ERROR_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new("tangle_operator_errors_total", "Errors by type"),
-        &["model", "error_type"],
+    registered(
+        IntCounterVec::new(
+            Opts::new("tangle_operator_errors_total", "Errors by type"),
+            &["model", "error_type"],
+        )
+        .expect("metric"),
     )
-    .expect("metric");
-    REGISTRY.register(Box::new(c.clone())).expect("register");
-    c
 });
 
 pub static HEARTBEATS_SENT: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new(
-        "tangle_operator_heartbeats_total",
-        "Heartbeats sent to chain",
+    registered(
+        IntCounter::new(
+            "tangle_operator_heartbeats_total",
+            "Heartbeats sent to chain",
+        )
+        .expect("metric"),
     )
-    .expect("metric");
-    REGISTRY.register(Box::new(c.clone())).expect("register");
-    c
 });
 
 pub static HEARTBEATS_FAILED: LazyLock<IntCounter> = LazyLock::new(|| {
-    let c = IntCounter::new(
-        "tangle_operator_heartbeats_failed_total",
-        "Failed heartbeat submissions",
+    registered(
+        IntCounter::new(
+            "tangle_operator_heartbeats_failed_total",
+            "Failed heartbeat submissions",
+        )
+        .expect("metric"),
     )
-    .expect("metric");
-    REGISTRY.register(Box::new(c.clone())).expect("register");
-    c
 });
 
 static TOTAL_SUCCESS: AtomicU64 = AtomicU64::new(0);
@@ -233,25 +240,13 @@ pub fn on_chain_metrics() -> Vec<(String, u64)> {
     let error = TOTAL_ERROR.load(Ordering::Relaxed);
     let total = success + error;
     let latency_count = LATENCY_COUNT.load(Ordering::Relaxed);
-    let latency_avg = if latency_count > 0 {
-        LATENCY_SUM_MS
-            .load(Ordering::Relaxed)
-            .checked_div(latency_count)
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    let latency_avg = LATENCY_SUM_MS
+        .load(Ordering::Relaxed)
+        .checked_div(latency_count)
+        .unwrap_or(0);
     let latency_max = LATENCY_MAX_MS.load(Ordering::Relaxed);
-    let uptime_bps = if total > 0 {
-        (success * 10000).checked_div(total).unwrap_or(0)
-    } else {
-        10000
-    };
-    let error_rate_bps = if total > 0 {
-        (error * 10000).checked_div(total).unwrap_or(0)
-    } else {
-        0
-    };
+    let uptime_bps = (success * 10000).checked_div(total).unwrap_or(10000);
+    let error_rate_bps = (error * 10000).checked_div(total).unwrap_or(0);
     let uptime_secs = STARTED_AT.elapsed().as_secs();
 
     vec![
@@ -293,14 +288,7 @@ pub fn health_summary() -> serde_json::Value {
             "error": error,
         },
         "latency": {
-            "avg_ms": if latency_count > 0 {
-                LATENCY_SUM_MS
-                    .load(Ordering::Relaxed)
-                    .checked_div(latency_count)
-                    .unwrap_or(0)
-            } else {
-                0
-            },
+            "avg_ms": LATENCY_SUM_MS.load(Ordering::Relaxed).checked_div(latency_count).unwrap_or(0),
             "max_ms": LATENCY_MAX_MS.load(Ordering::Relaxed),
 
         },

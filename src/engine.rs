@@ -385,8 +385,8 @@ impl EngineProcess {
         let mut urls = Vec::new();
         for replica in 0..self.config.replicas {
             let mut config = self.config.clone();
+            config.host = "127.0.0.1".into();
             if config.engine == EngineKind::Sglang {
-                config.host = "127.0.0.1".into();
                 config.port = u16::try_from(replica + 1)
                     .ok()
                     .and_then(|offset| config.port.checked_add(offset))
@@ -450,7 +450,7 @@ impl EngineProcess {
             ensure!(!argv.is_empty(), "empty router command");
             argv.extend([
                 "--host".into(),
-                self.config.host.clone(),
+                "127.0.0.1".into(),
                 "--port".into(),
                 self.config.port.to_string(),
                 "--policy".into(),
@@ -536,7 +536,11 @@ impl EngineProcess {
     }
 
     pub fn endpoint(&self) -> String {
-        let host = match self.config.host.as_str() {
+        let host = match if self.managed {
+            "127.0.0.1"
+        } else {
+            self.config.host.as_str()
+        } {
             "0.0.0.0" => "127.0.0.1",
             "::" | "[::]" => "[::1]",
             host => host,
