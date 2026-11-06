@@ -446,12 +446,10 @@ mod anvil_e2e {
 
         let result = provider.authorize(&proof).await;
         assert!(result.is_err(), "should reject insufficient amount");
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("less than requested")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("less than requested"));
     }
 
     #[tokio::test]
@@ -522,12 +520,10 @@ mod anvil_e2e {
 
         let result = provider.authorize(&proof).await;
         assert!(result.is_err(), "should reject transfer to wrong recipient");
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("no ERC-20 Transfer to operator")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no ERC-20 Transfer to operator"));
     }
 
     #[tokio::test]
