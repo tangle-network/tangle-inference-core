@@ -407,11 +407,7 @@ pub fn acquire_permit(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePer
     })
 }
 
-/// Full billing gate: extract SpendAuth from body or x402 header, enforce
-/// `billing_required`, validate signature/nonce/balance, and pre-authorize
-/// the spend on-chain. Returns `(spend_auth, preauth_amount)` on success.
-///
-/// Callers settle after serving via [`settle_billing`].
+/// Extract, validate and pre-authorize a SpendAuth; callers settle via [`settle_billing`].
 #[allow(clippy::result_large_err)]
 pub async fn billing_gate(
     state: &AppState,
@@ -435,6 +431,7 @@ pub async fn billing_gate(
     };
 
     let preauth_amount = validate_spend_auth(state, &spend_auth).await?;
+    require_preauth_covers(state, preauth_amount, estimated_cost)?;
 
     if let Err(e) = state.billing.authorize_spend(&spend_auth).await {
         tracing::error!(error = %e, "authorizeSpend failed");
@@ -447,6 +444,14 @@ pub async fn billing_gate(
     }
 
     Ok((Some(spend_auth), Some(preauth_amount)))
+}
+
+/// Settlement charges at most the pre-authorization, so it must cover the request's maximum cost.
+#[allow(clippy::result_large_err)]
+fn require_preauth_covers(state: &AppState, preauth: u64, max_cost: u64) -> Result<(), Response> {
+    let floor = max_cost.max(state.billing_config.min_charge_amount);
+    let (b, t) = (&state.billing_config, &state.tangle_config);
+    (preauth >= floor).then_some(()).ok_or_else(|| payment_required(b, t, state.operator_address, floor))
 }
 
 /// Settle metered usage up to the pre-authorization, or claim it in full when usage is absent.
@@ -549,10 +554,8 @@ pub async fn authorize_request(
     let preauth = match &proof {
         PaymentProof::SpendAuth(spend_auth) => {
             let preauth = validate_spend_auth(state, spend_auth).await?;
-            // Reject an authorization that exceeds 1.5× the estimated max cost
-            // so a request can't lock up far more credit than it can plausibly
-            // consume (settlement itself is metered — the unused pre-auth is
-            // refunded by `settlePayment`).
+            require_preauth_covers(state, preauth, estimated_max_cost)?;
+            // Cap locked credit at 1.5x the estimate; settlePayment refunds the unused part.
             let ceiling = estimated_max_cost.saturating_mul(3) / 2;
             if estimated_max_cost > 0 && preauth > ceiling {
                 return Err(error_response(
@@ -607,12 +610,8 @@ pub async fn authorize_request(
     })
 }
 
-/// Settle a request's payment after serving, dispatched by rail. Shielded
-/// settles the metered amount via `settlePayment` when `actual_cost` is known
-/// (the contract refunds the unused pre-auth), or claims the full pre-auth via
-/// `claimPayment` when usage metering is unavailable (e.g. a streaming backend
-/// that ended without a usage chunk). Direct is already paid (no-op). Errors
-/// are logged without changing the already-served response.
+/// Settle after serving: shielded settles metered usage, or claims the pre-auth when usage is
+/// unknown; direct is already paid. Errors are logged; the served response stands.
 pub async fn settle_request(state: &AppState, auth: &AuthorizedPayment, actual_cost: Option<u64>) {
     if let PaymentProof::SpendAuth(ref spend_auth) = auth.proof {
         if let Some(preauth) = auth.preauth {
