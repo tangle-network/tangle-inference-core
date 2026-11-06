@@ -159,8 +159,6 @@ impl RequestGuard {
         self.completion_tokens = completion;
     }
 
-    /// Record time-to-first-token in milliseconds.
-
     pub fn set_success(&mut self) {
         self.success = true;
     }

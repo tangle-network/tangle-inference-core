@@ -3,7 +3,6 @@ pub mod engine;
 pub mod health;
 pub mod operator;
 pub mod recipe;
-pub mod settlement_queue;
 pub mod weights;
 
 #[cfg(all(feature = "billing", feature = "metrics"))]
@@ -36,11 +35,9 @@ pub use payment::{
 #[cfg(all(feature = "http", feature = "billing"))]
 pub use server::{
     acquire_permit, billing_gate, error_response, extract_x402_spend_auth, gpu_health_handler,
-    metrics_handler, payment_required, plan_settlement, settle_billing,
-    settle_billing_with_recovery, validate_spend_auth, AccountGuard, AppState, AppStateBuilder,
-    ErrorDetail, ErrorResponse, NonceStore, SettlementPlan, SpendAuthPayload,
+    metrics_handler, payment_required, settle_billing, validate_spend_auth, AccountGuard, AppState,
+    AppStateBuilder, ErrorDetail, ErrorResponse, NonceStore, SpendAuthPayload,
 };
-pub use settlement_queue::{FailedSettlement, SettlementRecoveryQueue};
 
 // Always available
 pub use config::{BillingConfig, GpuConfig, ServerConfig, TangleConfig};

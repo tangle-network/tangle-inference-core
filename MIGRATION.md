@@ -6,7 +6,7 @@ cargo-tangle binary and native tnt-core manager initialization release are core
 merge prerequisites; do not copy their missing interfaces into core.
 
 Shared capability ownership is maintained in the
-[ecosystem Owners table](../agent-container/docs/ecosystem/ECOSYSTEM.md).
+[ecosystem Owners table](https://github.com/tangle-network/agent-container/blob/develop/docs/ecosystem/ECOSYSTEM.md#owners--one-owner-per-concept).
 
 Arms select exact catalog ids. Each class entry owns its supported TP values and
 argument/environment overlay; VRAM and node limits are read from the SDK. A

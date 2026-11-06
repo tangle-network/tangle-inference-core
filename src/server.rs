@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use crate::billing::BillingClient;
 use crate::config::{BillingConfig, TangleConfig};
 use crate::payment::PaymentProof;
-use crate::settlement_queue::{FailedSettlement, SettlementRecoveryQueue};
 
 // x402 header constants
 pub const X402_PAYMENT_REQUIRED: &str = "X-Payment-Required";
@@ -450,116 +449,23 @@ pub async fn billing_gate(
     Ok((Some(spend_auth), Some(preauth_amount)))
 }
 
-/// How a post-serve settlement should be executed on-chain. Factored out of
-/// [`settle_billing_with_recovery`] so the dispatch decision is unit-testable
-/// without a chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettlementPlan {
-    /// Usage metering available: call `settlePayment` with this amount. The
-    /// operator receives exactly this and the contract refunds the unused
-    /// pre-auth (`pre-auth − amount`) to the user's credit account.
-    Metered(u64),
-    /// Usage metering unavailable (e.g. streaming backend ended without a
-    /// usage chunk): call `claimPayment`, settling the full pre-auth — the
-    /// original settlement behavior.
-    FullPreAuth(u64),
-    /// Zero charge: nothing to settle on-chain.
-    Skip,
-}
-
-/// Decide how to settle a served request. `actual_cost = Some(_)` is the
-/// metered cost from real usage (capped at the pre-auth); `None` means usage
-/// metering was unavailable and the full pre-auth is claimed.
-pub fn plan_settlement(preauth_amount: u64, actual_cost: Option<u64>) -> SettlementPlan {
-    match actual_cost {
-        Some(cost) => {
-            let charge = cost.min(preauth_amount);
-            if charge == 0 {
-                SettlementPlan::Skip
-            } else {
-                SettlementPlan::Metered(charge)
-            }
-        }
-        None => {
-            if preauth_amount == 0 {
-                SettlementPlan::Skip
-            } else {
-                SettlementPlan::FullPreAuth(preauth_amount)
-            }
-        }
-    }
-}
-
-/// Settle billing after successful inference.
-///
-/// When `actual_cost` is `Some`, the metered amount (capped at the pre-auth)
-/// is settled via `settlePayment` and the contract refunds the unused pre-auth
-/// to the user. When `actual_cost` is `None` — usage metering unavailable, see
-/// [`plan_settlement`] — the full pre-auth is claimed via `claimPayment`,
-/// unchanged from the original behavior.
-///
-/// If the on-chain settlement fails after all retries and a recovery queue is
-/// provided, the failed settlement is persisted for later retry.
-///
-/// Returns an error if the settlement fails after all retries so callers
-/// can log / alert appropriately.
+/// Settle metered usage up to the pre-authorization, or claim it in full when usage is absent.
 pub async fn settle_billing(
     billing: &BillingClient,
     spend_auth: &SpendAuthPayload,
     preauth_amount: u64,
     actual_cost: Option<u64>,
 ) -> Result<(), anyhow::Error> {
-    settle_billing_with_recovery(billing, spend_auth, preauth_amount, actual_cost, None).await
-}
-
-/// Like [`settle_billing`] but accepts an optional dead-letter queue for
-/// failed settlements.
-pub async fn settle_billing_with_recovery(
-    billing: &BillingClient,
-    spend_auth: &SpendAuthPayload,
-    preauth_amount: u64,
-    actual_cost: Option<u64>,
-    recovery_queue: Option<&SettlementRecoveryQueue>,
-) -> Result<(), anyhow::Error> {
-    let plan = plan_settlement(preauth_amount, actual_cost);
-
-    tracing::info!(actual_cost, preauth_amount, ?plan, "settling billing");
-
-    let (charge_amount, result) = match plan {
-        SettlementPlan::Metered(charge) => {
-            (charge, billing.settle_payment(spend_auth, charge).await)
-        }
-        SettlementPlan::FullPreAuth(charge) => {
-            (charge, billing.claim_payment(spend_auth, charge).await)
-        }
-        SettlementPlan::Skip => return Ok(()),
-    };
-
-    if let Err(e) = result {
-        if let Some(queue) = recovery_queue {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            queue.enqueue(FailedSettlement {
-                commitment: spend_auth.commitment.clone(),
-                nonce: spend_auth.nonce,
-                amount: charge_amount.to_string(),
-                operator: spend_auth.operator.clone(),
-                service_id: spend_auth.service_id,
-                timestamp: now,
-                error: format!("{e}"),
-                retry_count: 0,
-            });
-            tracing::error!(
-                error = %e,
-                "settlement failed — enqueued to dead-letter queue for retry"
-            );
-        }
-        return Err(e);
+    let charge = actual_cost.unwrap_or(preauth_amount).min(preauth_amount);
+    if charge == 0 {
+        return Ok(());
     }
-
-    Ok(())
+    tracing::info!(actual_cost, preauth_amount, charge, "settling billing");
+    if actual_cost.is_some() {
+        billing.settle_payment(spend_auth, charge).await
+    } else {
+        billing.claim_payment(spend_auth, charge).await
+    }
 }
 
 // ─── Unified, rail-agnostic request billing ───────────────────────────────────
@@ -705,22 +611,13 @@ pub async fn authorize_request(
 /// settles the metered amount via `settlePayment` when `actual_cost` is known
 /// (the contract refunds the unused pre-auth), or claims the full pre-auth via
 /// `claimPayment` when usage metering is unavailable (e.g. a streaming backend
-/// that ended without a usage chunk). Direct is already paid (no-op). Both go
-/// through dead-letter recovery on failure. Errors are logged, not propagated —
-/// a settlement failure must not fail the already-served response.
+/// that ended without a usage chunk). Direct is already paid (no-op). Errors
+/// are logged without changing the already-served response.
 pub async fn settle_request(state: &AppState, auth: &AuthorizedPayment, actual_cost: Option<u64>) {
     if let PaymentProof::SpendAuth(ref spend_auth) = auth.proof {
         if let Some(preauth) = auth.preauth {
-            if let Err(e) = settle_billing_with_recovery(
-                &state.billing,
-                spend_auth,
-                preauth,
-                actual_cost,
-                state.settlement_recovery_queue.as_deref(),
-            )
-            .await
-            {
-                tracing::error!(error = %e, "settlement failed (enqueued for recovery if configured)");
+            if let Err(e) = settle_billing(&state.billing, spend_auth, preauth, actual_cost).await {
+                tracing::error!(error = %e, "settlement failed");
             }
         }
     }

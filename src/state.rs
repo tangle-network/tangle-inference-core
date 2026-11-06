@@ -1,7 +1,6 @@
 use crate::billing::BillingClient;
 use crate::config::{BillingConfig, ServerConfig, TangleConfig};
 use crate::payment::{create_provider, PaymentProvider};
-use crate::settlement_queue::SettlementRecoveryQueue;
 use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -153,8 +152,6 @@ pub struct AppState {
     pub operator_address: Address,
     pub semaphore: Arc<tokio::sync::Semaphore>,
     pub active_per_account: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    /// Persistent dead-letter queue for failed on-chain settlements.
-    pub settlement_recovery_queue: Option<Arc<SettlementRecoveryQueue>>,
     /// Backend-specific state. Downcast via [`AppState::backend`].
     pub backend: Arc<dyn std::any::Any + Send + Sync>,
     /// Generic payment provider (replaces direct BillingClient usage).
@@ -212,7 +209,6 @@ pub struct AppStateBuilder {
     tangle_config: Option<Arc<TangleConfig>>,
     operator_address: Option<Address>,
     max_concurrent: Option<usize>,
-    settlement_recovery_queue: Option<Arc<SettlementRecoveryQueue>>,
     payment_provider: Option<Arc<dyn PaymentProvider>>,
     backend: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
@@ -254,11 +250,6 @@ impl AppStateBuilder {
 
     pub fn max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = Some(n);
-        self
-    }
-
-    pub fn settlement_recovery_queue(mut self, q: Arc<SettlementRecoveryQueue>) -> Self {
-        self.settlement_recovery_queue = Some(q);
         self
     }
 
@@ -358,7 +349,6 @@ impl AppStateBuilder {
             operator_address,
             semaphore,
             active_per_account: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            settlement_recovery_queue: self.settlement_recovery_queue,
             payment_provider,
             backend,
             endpoint_authorization,
