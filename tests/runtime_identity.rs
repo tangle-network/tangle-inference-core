@@ -117,6 +117,10 @@ async fn runtime_identity_follows_own_running_inodes() -> Result<()> {
         .unwrap();
     let observed: Option<String> = serde_json::from_str(&own)?;
     assert_eq!(observed.as_deref(), Some(expected));
+    assert_eq!(
+        operator_executable_sha256().await.as_deref(),
+        Some(expected)
+    );
     // A launcher may exec a different image without changing its supervised PID.
     use tangle_inference_core::engine::{EngineConfig, EngineProcess};
     let python = Command::new("python3")
@@ -129,13 +133,10 @@ async fn runtime_identity_follows_own_running_inodes() -> Result<()> {
     assert!(python.status.success());
     let second_python = directory.path().join("python-second");
     std::fs::copy(std::str::from_utf8(&python.stdout)?.trim(), &second_python)?;
-    {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&second_python)?
-            .write_all(b"review fixture: distinct executable bytes\n")?;
-    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&second_python)?
+        .set_len(256 * 1024 * 1024)?;
     let switch = directory.path().join("switch");
     let peer = directory.path().join("exec-peer.py");
     std::fs::write(
@@ -174,7 +175,31 @@ http.server.HTTPServer((a.host,a.port),H).serve_forever()
     .await?;
     std::fs::write(&switch, b"exec now")?;
     process.wait_ready().await?;
-    let facts = process.runtime_info().await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()?;
+    let mut samples = 0;
+    let mut false_health = 0;
+    let mut metadata = Box::pin(process.runtime_info());
+    let observation = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                facts = &mut metadata => break facts,
+                healthy = process.is_healthy() => {
+                    client.get(format!("{}/health", process.endpoint()))
+                        .send().await?.error_for_status()?;
+                    samples += 1;
+                    false_health += usize::from(!healthy);
+                }
+            }
+        }
+    })
+    .await;
+    drop(metadata);
+    if !matches!(observation, Ok(Ok(_))) {
+        process.shutdown().await;
+    }
+    let facts = observation??;
     let pid = facts["processes"][0]["pid"].as_u64().unwrap();
     let actual_executable = std::fs::read(format!("/proc/{pid}/exe"))?;
     let actual_argv = std::fs::read(format!("/proc/{pid}/cmdline"))?;
@@ -187,6 +212,14 @@ http.server.HTTPServer((a.host,a.port),H).serve_forever()
         "argv_sha256":facts["processes"][0]["argv_sha256"],
     });
     process.shutdown().await;
+    assert!(
+        samples > 0,
+        "metadata did not overlap a public health observation"
+    );
+    assert_eq!(
+        false_health, 0,
+        "metadata made a healthy HTTP worker report unready: {false_health}/{samples} observations"
+    );
     assert_eq!(facts["ready"], true);
     assert_eq!(
         observed, expected,
