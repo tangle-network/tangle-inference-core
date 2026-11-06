@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::billing::BillingClient;
 use crate::config::{BillingConfig, TangleConfig};
 use crate::payment::{PaymentProof, PaymentProvider};
 use crate::settlement_queue::{FailedSettlement, SettlementRecoveryQueue};
@@ -20,10 +21,7 @@ pub const X402_PAYMENT_SIGNATURE: &str = "X-Payment-Signature";
 
 pub use crate::state::{AccountGuard, AppState, AppStateBuilder, NonceKey, NonceStore};
 
-/// Deserialize a u64 that may be JSON number or string.
-/// JS bigints serialize as JSON strings; this lets the Rust operator accept
-/// both the number form (from Rust/Go clients) and the string form (from the
-/// @tangle-network/tcloud SDK which emits `nonce: "0"`, `serviceId: "1"`, etc).
+/// Accept JSON numbers and bigint strings.
 fn de_u64_flex<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     use serde::Deserialize as _;
     #[derive(serde::Deserialize)]
@@ -52,11 +50,7 @@ fn de_u8_flex<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u8, D
     }
 }
 
-/// ShieldedCredits spend authorization payload.
-///
-/// Accepts both camelCase (from JS SDK) and snake_case field names via
-/// `rename_all`. Numeric fields accept JSON number OR string form — the JS
-/// SDK serializes bigints as strings for JSON safety.
+/// ShieldedCredits authorization with camelCase JSON fields.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SpendAuthPayload {
@@ -103,6 +97,21 @@ pub fn error_response(
         },
     };
     (status, Json(body)).into_response()
+}
+
+/// A backend that is still starting must give clients a bounded retry response.
+pub fn backend_unavailable() -> Response {
+    let mut response = error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Backend is starting; retry shortly.".into(),
+        "server_error",
+        "backend_unavailable",
+    );
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("10"),
+    );
+    response
 }
 
 /// Build a 402 Payment Required response with x402 headers.
@@ -170,11 +179,7 @@ pub fn extract_x402_spend_auth(headers: &HeaderMap) -> Option<SpendAuthPayload> 
     None
 }
 
-/// Validate a SpendAuth payload against operator configuration.
-///
-/// Checks: amount parsing, min charge, max spend, operator address match,
-/// service ID match, nonce replay. Returns an error response on any failure,
-/// or Ok(parsed_amount) on success.
+/// Validate the authorization before committing payment.
 #[allow(clippy::result_large_err)]
 pub async fn validate_spend_auth(
     state: &AppState,
@@ -687,12 +692,7 @@ pub async fn authorize_request(
 
     // Don't commit gas / verify a payment for a backend we can't serve.
     if !is_healthy.await {
-        return Err(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "inference backend is unavailable — payment not committed".to_string(),
-            "upstream_error",
-            "vllm_unhealthy",
-        ));
+        return Err(backend_unavailable());
     }
 
     // Commit: shielded authorizes on-chain; direct verifies the transfer.
