@@ -161,19 +161,21 @@ http.server.HTTPServer((a.host,a.port),H).serve_forever()
     let port = std::net::TcpListener::bind("127.0.0.1:0")?
         .local_addr()?
         .port();
-    let process = EngineProcess::spawn(EngineConfig {
-        model: "fixture/runtime-model".into(),
-        port,
-        startup_timeout_secs: 5,
-        command: format!(
-            "python3 {} {} {}",
-            peer.display(),
-            switch.display(),
-            second_python.display()
-        ),
-        ..Default::default()
-    })
-    .await?;
+    let process = std::sync::Arc::new(
+        EngineProcess::spawn(EngineConfig {
+            model: "fixture/runtime-model".into(),
+            port,
+            startup_timeout_secs: 5,
+            command: format!(
+                "python3 {} {} {}",
+                peer.display(),
+                switch.display(),
+                second_python.display()
+            ),
+            ..Default::default()
+        })
+        .await?,
+    );
     std::fs::write(&switch, b"exec now")?;
     process.wait_ready().await?;
     let client = reqwest::Client::builder()
@@ -181,11 +183,12 @@ http.server.HTTPServer((a.host,a.port),H).serve_forever()
         .build()?;
     let mut samples = 0;
     let mut false_health = 0;
-    let mut metadata = Box::pin(process.runtime_info());
+    let metadata_owner = std::sync::Arc::clone(&process);
+    let mut metadata = tokio::spawn(async move { metadata_owner.runtime_info().await });
     let observation = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             tokio::select! {
-                facts = &mut metadata => break facts,
+                facts = &mut metadata => break facts?,
                 healthy = process.is_healthy() => {
                     client.get(format!("{}/health", process.endpoint()))
                         .send().await?.error_for_status()?;
@@ -197,10 +200,11 @@ http.server.HTTPServer((a.host,a.port),H).serve_forever()
         }
     })
     .await;
-    drop(metadata);
-    if !matches!(observation, Ok(Ok(_))) {
+    if !matches!(&observation, Ok(Ok(_))) {
+        metadata.abort();
         process.shutdown().await;
     }
+    drop(metadata);
     let facts = observation??;
     let pid = facts["processes"][0]["pid"].as_u64().unwrap();
     let actual_executable = std::fs::read(format!("/proc/{pid}/exe"))?;
