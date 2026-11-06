@@ -385,7 +385,7 @@ async fn verify_cache(
         }
     }
     ensure!(entries.is_empty(), "cached model file is missing");
-    let mut buffer = [0; 64 * 1024];
+    let mut buffer = vec![0; 64 * 1024];
     for shard in &manifest.files {
         let file = open_regular(&directory.join(&shard.path))?;
         ensure!(
