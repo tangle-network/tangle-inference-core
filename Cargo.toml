@@ -14,6 +14,7 @@ metrics = ["dep:prometheus"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+blueprint-core = { git = "https://github.com/tangle-network/blueprint", rev = "74801e0e62a5918f63ef471efa8e975fa8c8e3b2", default-features = false }
 blueprint-tee = { version = "=0.2.0-alpha.11", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -38,4 +39,3 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-futures = "0.3"

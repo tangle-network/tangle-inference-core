@@ -182,9 +182,9 @@ dependencies = [
 
 [[package]]
 name = "alloy-core"
-version = "1.5.7"
+version = "1.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23e8604b0c092fabc80d075ede181c9b9e596249c70b99253082d7e689836529"
+checksum = "c6a70852055d66af821d28497e690c95950020ed1ee4c7a0ab9b02a01ac75ee3"
 dependencies = [
  "alloy-dyn-abi",
  "alloy-json-abi",
@@ -195,9 +195,9 @@ dependencies = [
 
 [[package]]
 name = "alloy-dyn-abi"
-version = "1.5.7"
+version = "1.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc2db5c583aaef0255aa63a4fe827f826090142528bba48d1bf4119b62780cad"
+checksum = "14b3b9990889736af898bd4e51f7d0c0228d6a9b9c3a5fecb3e6b25a7abc791c"
 dependencies = [
  "alloy-json-abi",
  "alloy-primitives",
@@ -206,7 +206,7 @@ dependencies = [
  "itoa",
  "serde",
  "serde_json",
- "winnow 0.7.15",
+ "winnow",
 ]
 
 [[package]]
@@ -789,7 +789,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77c2a8abc3334044013b23d5e438cc5dc802e5544cc42b713d0840d5185967cc"
 dependencies = [
  "serde",
- "winnow 1.0.1",
+ "winnow",
 ]
 
 [[package]]
@@ -1674,6 +1674,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "blueprint-core"
+version = "0.2.0-alpha.6"
+source = "git+https://github.com/tangle-network/blueprint?rev=74801e0e62a5918f63ef471efa8e975fa8c8e3b2#74801e0e62a5918f63ef471efa8e975fa8c8e3b2"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "hashbrown 0.16.1",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "tiny-keccak",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "blueprint-crypto"
 version = "0.2.0-alpha.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1837,7 +1853,7 @@ version = "0.2.0-alpha.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e02a6772079ab2978240f230a714c1148b354e3e9fa63a30e781ede8b0884eea"
 dependencies = [
- "blueprint-core",
+ "blueprint-core 0.2.0-alpha.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "blueprint-std",
  "chacha20poly1305",
  "document-features",
@@ -5133,6 +5149,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "blueprint-core 0.2.0-alpha.6 (git+https://github.com/tangle-network/blueprint?rev=74801e0e62a5918f63ef471efa8e975fa8c8e3b2)",
  "blueprint-keystore",
  "blueprint-tee",
  "futures",
@@ -5398,7 +5415,7 @@ dependencies = [
  "indexmap 2.13.1",
  "toml_datetime",
  "toml_parser",
- "winnow 1.0.1",
+ "winnow",
 ]
 
 [[package]]
@@ -5407,7 +5424,7 @@ version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
- "winnow 1.0.1",
+ "winnow",
 ]
 
 [[package]]
@@ -6124,12 +6141,6 @@ name = "windows_x86_64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
-
-[[package]]
-name = "winnow"
-version = "0.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 
 [[package]]
 name = "winnow"

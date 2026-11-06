@@ -243,3 +243,118 @@ with open(sys.argv[1], 'w') as output:
     );
     Ok(())
 }
+
+#[test]
+fn tee_detection_matches_sdk_without_claiming_attestation() {
+    let expected = blueprint_tee::detect_tee_provider().map(|provider| provider.to_string());
+    let actual = tangle_inference_core::tee_status();
+    assert_eq!(actual["provider"], serde_json::json!(expected));
+    assert_eq!(actual["detected"], expected.is_some());
+    assert_eq!(actual["attested"], false);
+}
+
+#[tokio::test]
+async fn replica_set_owns_workers_router_and_device_partitions() -> anyhow::Result<()> {
+    if std::env::var_os("TANGLE_ENGINE_REPLICA_PROBE").is_none() {
+        let output = tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "replica_set_owns_workers_router_and_device_partitions",
+                "--nocapture",
+            ])
+            .env("TANGLE_ENGINE_REPLICA_PROBE", "1")
+            .env("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let script = dir.path().join("peer.py");
+    std::fs::write(
+        &script,
+        r#"import argparse,http.server,json,os,sys,urllib.request
+p=argparse.ArgumentParser()
+p.add_argument('role');p.add_argument('directory');p.add_argument('--host');p.add_argument('--port',type=int)
+p.add_argument('--worker-urls',nargs='+');p.add_argument('--policy')
+a,_=p.parse_known_args()
+with open(a.directory+'/'+str(a.port)+'.json','w') as f:
+    json.dump({'role':a.role,'urls':a.worker_urls,'policy':a.policy,'devices':os.environ.get('CUDA_VISIBLE_DEVICES'),'pid':os.getpid()},f)
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if a.role=='router' and self.path=='/workers':
+            body=json.dumps([urllib.request.urlopen(url+'/health').status for url in a.worker_urls]).encode()
+        else: body=b'ok'
+        self.send_response(200);self.end_headers();self.wfile.write(body)
+    def log_message(self,*args):pass
+http.server.HTTPServer((a.host,a.port),H).serve_forever()
+"#,
+    )?;
+    // Reserve a contiguous range without choosing a fixed shared test port.
+    let (port, reservations) = (0..100)
+        .find_map(|_| {
+            let first = TcpListener::bind("127.0.0.1:0").ok()?;
+            let port = first.local_addr().ok()?.port();
+            let second = TcpListener::bind(("127.0.0.1", port.checked_add(1)?)).ok()?;
+            let third = TcpListener::bind(("127.0.0.1", port.checked_add(2)?)).ok()?;
+            Some((port, [first, second, third]))
+        })
+        .ok_or_else(|| anyhow::anyhow!("no contiguous loopback ports"))?;
+    let mut value = serde_json::to_value(config(EngineKind::Sglang))?;
+    value["base_family"] = "deepseek-v4.1-flash".into();
+    value["gpu_class"] = "nvidia-b200".into();
+    value["tensor_parallel_size"] = 4.into();
+    value["port"] = port.into();
+    value["replicas"] = 2.into();
+    value["command"] = format!(
+        "python3 {} worker {}",
+        script.display(),
+        dir.path().display()
+    )
+    .into();
+    value["router_command"] = format!(
+        "python3 {} router {}",
+        script.display(),
+        dir.path().display()
+    )
+    .into();
+    drop(reservations);
+    let process = EngineProcess::spawn(serde_json::from_value(value)?).await?;
+    process.wait_ready().await?;
+    let result: serde_json::Value = process
+        .client()
+        .get(format!("{}/workers", process.endpoint()))
+        .send()
+        .await?
+        .json()
+        .await?;
+    process.shutdown().await;
+    assert_eq!(result, serde_json::json!([200, 200]));
+    let mut devices = vec![];
+    for file in std::fs::read_dir(dir.path())? {
+        let file = file?;
+        if file.path().extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let row: serde_json::Value = serde_json::from_slice(&std::fs::read(file.path())?)?;
+        if row["role"] == "worker" {
+            devices.push(row["devices"].as_str().unwrap().to_owned());
+        } else {
+            assert_eq!(row["policy"], "cache_aware");
+            assert_eq!(row["urls"].as_array().unwrap().len(), 2);
+        }
+        #[cfg(target_os = "linux")]
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", row["pid"])).exists(),
+            "managed child survived shutdown"
+        );
+    }
+    devices.sort();
+    assert_eq!(devices, ["0,1,2,3", "4,5,6,7"]);
+    Ok(())
+}
