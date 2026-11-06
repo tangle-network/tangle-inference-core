@@ -11,7 +11,18 @@ assert.equal(result.status, 0, result.stderr);
 assert(!result.stdout.includes(key));
 assert(!result.stderr.includes(key));
 const signed = JSON.parse(result.stdout);
-const verified = spawnSync('cast', ['wallet', 'verify', '--no-hash', '--address', '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', signed.digest, signed.signature], { encoding: 'utf8' });
+const typed = {
+  domain: { name: 'ShieldedCredits', version: '1', chainId: '31337', verifyingContract: args[1] },
+  primaryType: 'SpendAuthorization',
+  types: {
+    EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }],
+    SpendAuthorization: [{ name: 'commitment', type: 'bytes32' }, { name: 'serviceId', type: 'uint64' }, { name: 'jobIndex', type: 'uint8' }, { name: 'amount', type: 'uint256' }, { name: 'operator', type: 'address' }, { name: 'nonce', type: 'uint256' }, { name: 'expiry', type: 'uint64' }],
+  },
+  message: { commitment: args[5], serviceId: args[7], jobIndex: args[9], amount: args[11], operator: args[13], nonce: args[15], expiry: args[17] },
+};
+const typedVerified = spawnSync('cast', ['wallet', 'verify', '--data', '--address', '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', JSON.stringify(typed), signed.signature], { encoding: 'utf8' });
+assert.equal(typedVerified.status, 0, typedVerified.stderr);
+const verified = spawnSync('cast' , ['wallet', 'verify', '--no-hash', '--address', '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266', signed.digest, signed.signature], { encoding: 'utf8' });
 assert.equal(verified.status, 0, verified.stderr);
 const forbidden = spawnSync('node', [script, '--private-key', 'not-a-key', ...args], { input: key, encoding: 'utf8' });
 assert.equal(forbidden.status, 1);

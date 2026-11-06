@@ -16,10 +16,10 @@ try {
     private_key: readFileSync(0, 'utf8').trim(),
     verifying_contract: values.verifying_contract,
     chain_id: values.chain_id,
-    auth: { ...Object.fromEntries(allowed.filter(k => !['chain_id', 'verifying_contract'].includes(k)).map(k => [k, values[k]])), signature: '0x' },
+    auth: { ...Object.fromEntries(allowed.filter(k => !['chain_id', 'verifying_contract'].includes(k)).map(k => [{ service_id: 'serviceId', job_index: 'jobIndex' }[k] ?? k, values[k]])), signature: '0x' },
   }).replace(/"chain_id":"(\d+)"/, '"chain_id":$1');
   const result = spawnSync('cargo', ['run', '--quiet', '--locked', '--manifest-path', fileURLToPath(new URL('../Cargo.toml', import.meta.url)), '--example', 'sign_spend_auth', '--'], { input: json, encoding: 'utf8' });
-  if (result.error || result.status !== 0) throw new Error('Signing failed; check Foundry toolchain and input');
+  if (result.error || result.status !== 0) throw new Error('Signing failed; check Rust toolchain and input');
   process.stdout.write(result.stdout);
 } catch (error) {
   console.error(error.message);

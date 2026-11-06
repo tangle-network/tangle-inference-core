@@ -49,8 +49,9 @@ settlement. Pass the metered cost as `Some(cost)`; `None` claims the full preaut
 Keep nonce and direct-transfer replay stores persistent across operator restarts.
 `qos::start_heartbeat` submits the same core metrics used by the HTTP endpoints.
 
-GPU detection and class/VRAM requirements follow the blueprint SDK's released API.
-The D9 lane STATUS records the pending SDK migration; no GPU catalog is owned here.
+Core currently retains its NVIDIA detection helper and legacy GPU configuration.
+The D9 lane STATUS tracks replacing these with the SDK's detection, catalog and
+class/VRAM-per-GPU API when released.
 
 ## Check changes
 
