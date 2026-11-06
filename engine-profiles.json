@@ -1,36 +1,33 @@
 {
   "image": "lmsysorg/sglang:v0.5.23-cu130@sha256:f832b5c39559c9caa900b22ad37c76fcce66470676855c42052102c537812f1f",
-  "common_args": ["--host", "0.0.0.0", "--port", "8000", "--tp", "8", "--mem-fraction-static", "0.8", "--context-length", "32768", "--enable-cache-report", "--reasoning-parser", "auto", "--tool-call-parser", "auto"],
+  "router_version": "0.3.2",
+  "common_args": ["--host", "0.0.0.0", "--mem-fraction-static", "0.8", "--context-length", "32768", "--enable-cache-report", "--reasoning-parser", "auto", "--tool-call-parser", "auto"],
+  "gpus": {"H100": 80, "H200": 141, "B200": 180},
+  "weight_memory_fraction": 0.95,
   "families": {
     "glm-5.3": {
-      "parent_model": "zai-org/GLM-5.3",
-      "architecture": "GlmMoeDsaForCausalLM",
-      "license": "GLM-5.3 custom commercial license; preserve notices and review the >$10B affiliate MaaS condition",
-      "license_url": "https://huggingface.co/zai-org/GLM-5.3/blob/main/LICENSE",
-      "precision": "Shipped FP8 e4m3 block128; no requantization",
-      "quantization": {"quant_method": "fp8", "weight_block_size": [128, 128]},
-      "args": [],
-      "recipe": "https://github.com/sgl-project/sglang/blob/v0.5.23/docs/cookbook/autoregressive/GLM/GLM-5.3.mdx"
+      "prediction_id": "abliterated-glm53-breakeven-throughput-20261106",
+      "parent_model": "zai-org/GLM-5.3", "architecture": "GlmMoeDsaForCausalLM", "requires_chat_template": true,
+      "license": "GLM-5.3 custom commercial license; preserve notices and review the >$10B affiliate MaaS condition", "license_url": "https://huggingface.co/zai-org/GLM-5.3/blob/main/LICENSE",
+      "recipe": "https://github.com/sgl-project/sglang/blob/v0.5.23/docs/cookbook/autoregressive/GLM/GLM-5.3.mdx", "default_shape": "h200-8", "args": [],
+      "baseline": {"model": "zai/glm-5.3", "aliases": ["zai/glm-5.3", "glm-5.3", "zai-org/GLM-5.3", "together/zai-org/GLM-5.3"], "label": "router-zai-glm-5.3-20261105", "base_url": "https://router.tangle.tools/v1", "key_name": "TANGLE_API_KEY", "key_vault": "agent-state.env"},
+      "arms": {
+        "native": {"quantization_file": "config.json", "quantization": {"quant_method": "fp8", "weight_block_size": [128, 128]}, "gpus": ["H200", "B200"], "recipe_tp": {"H200": [8], "B200": [8]}, "args": []},
+        "nvfp4": {"quantization_file": "hf_quant_config.json", "quantization": {"quant_algo": "NVFP4"}, "gpus": ["B200"], "recipe_tp": {"B200": [4, 8]}, "default_shape": "b200-8", "args": ["--quantization", "modelopt_fp4"],
+          "quantizer": {"repository": "https://github.com/NVIDIA/Model-Optimizer", "revision": "bc00ef3043103a32881f4f792d4828994eec546e", "entrypoint": "examples/hf_ptq/hf_ptq.py", "recipe": "general/ptq/nvfp4_experts_only_input_scale1-kv_fp8_cast", "calibration_dataset": "abisee/cnn_dailymail", "calibration_revision": "96df5e686bee6baa90b8bee7c28b81fa3fa6223d", "calibration_samples": 512, "command": ["torchrun", "--nproc_per_node=8", "{modelopt_root}/examples/hf_ptq/hf_ptq.py", "--pyt_ckpt_path", "{source_directory}", "--recipe", "general/ptq/nvfp4_experts_only_input_scale1-kv_fp8_cast", "--dataset", "cnn_dailymail", "--calib_size", "512", "--export_path", "{output_directory}"], "source": "https://huggingface.co/nvidia/GLM-5-NVFP4", "status": "adaptation to supplied GLM-5.3 requires actual calibration provenance, fresh shard hashes and the same quality gate; never substitute NVIDIA stock weights"}}
+      }
     },
     "deepseek-v4.1-flash-1017": {
-      "parent_model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-      "architecture": "DeepseekV41ForCausalLM",
-      "license": "MIT; preserve copyright and license notices",
-      "license_url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE",
-      "precision": "Shipped FP8 dynamic block32 with ue8m0 scales and FP4 experts; preserve packed tensors",
-      "quantization": {"quant_method": "fp8", "weight_block_size": [32, 32], "scale_fmt": "ue8m0", "expert_dtype": "fp4"},
-      "args": ["--ep-size", "8", "--attention-backend", "dsv4", "--moe-runner-backend", "flashinfer_mxfp4", "--cuda-graph-max-bs-decode", "64"],
-      "recipe": "https://github.com/sgl-project/sglang/blob/v0.5.23/docs/src/snippets/configs/deepseek-ai/deepseek-v4_1.jsx"
-    },
-    "qwen3": {
-      "parent_model": "Qwen/Qwen3-0.6B",
-      "architecture": "Qwen3ForCausalLM",
-      "license": "Apache-2.0; preserve copyright and license notices",
-      "license_url": "https://huggingface.co/Qwen/Qwen3-0.6B/blob/main/LICENSE",
-      "precision": "Shipped BF16; no requantization",
-      "quantization": {},
-      "args": ["--tp", "1", "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen25"],
-      "recipe": "https://github.com/QwenLM/Qwen3/blob/main/docs/source/deployment/sglang.md"
+      "prediction_id": "abliterated-deepseek1017-breakeven-throughput-20261106",
+      "parent_model": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "architecture": "DeepseekV41ForCausalLM", "requires_chat_template": false,
+      "license": "MIT; preserve copyright and license notices", "license_url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE",
+      "recipe": "https://github.com/sgl-project/sglang/blob/v0.5.23/docs/src/snippets/configs/deepseek-ai/deepseek-v4_1.jsx", "default_shape": "h200-8",
+      "args": ["--attention-backend", "dsv4", "--max-running-requests", "256", "--cuda-graph-max-bs-decode", "64"],
+      "baseline": {"model": "deepseek/deepseek-v4.1-flash", "aliases": ["deepseek/deepseek-v4.1-flash", "deepseek-v4.1-flash", "together/deepseek-ai/DeepSeek-V4.1-Flash", "deepseek-ai/DeepSeek-V4.1-Flash", "deepseek-ai/DeepSeek-V4.1-Flash-1017"], "label": "router-us-deepseek-v4.1-flash-20261105", "base_url": "https://router.tangle.tools/v1", "key_name": "US_TANGLE_API_KEY", "key_vault": "agent-state.env"},
+      "arms": {"native": {"quantization_file": "config.json", "quantization": {"quant_method": "fp8", "weight_block_size": [32, 32], "scale_fmt": "ue8m0", "expert_dtype": "fp4"}, "gpus": ["H100", "H200", "B200"], "recipe_tp": {"H200": [8], "B200": [4]}, "args": ["--attn-dp-size", "{tp}", "--moe-a2a-backend", "none", "--speculative-algorithm", "DSPARK", "--speculative-dspark-block-size", "5"],
+        "gpu_overrides": {"H100": {"args": ["--ep-size", "1", "--moe-runner-backend", "marlin", "--enable-decoder-swa-bounded-replay"], "env": {"SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "0"}}, "H200": {"args": ["--ep-size", "1", "--moe-runner-backend", "marlin", "--enable-decoder-swa-bounded-replay"], "env": {"SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "0"}}, "B200": {"args": ["--ep-size", "{tp}", "--moe-runner-backend", "flashinfer_mxfp4"], "env": {}}},
+        "status": "Unvalidated 1017 candidates: DP attention uses attn-dp-size=TP with MoE A2A none; bundled three-stage DSpark uses checkpoint block size5. No separate validated MTP/EAGLE recipe is asserted. All local KV headroom, quality and performance remain unmeasured.",
+        "hopper_source": "https://github.com/sgl-project/sglang/pull/41251", "hopper_merge_revision": "391e665dab9b3d00f0a614a9a0f36306c279aea3", "hopper_status": "Merge is an ancestor of v0.5.23. PR measured original Flash on8H200 TP8/EP1 Marlin, bounded SWA and GPU-resident Engram, without DP attention or speculation; H100,1017,DP+DSpark combination and4H200 remain experiments."}}
     }
   }
 }
