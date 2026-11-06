@@ -9,6 +9,8 @@ pub struct RecipeCatalog {
     pub image: String,
     pub common_args: Vec<String>,
     pub families: BTreeMap<String, FamilyRecipe>,
+    #[serde(default)]
+    pub measurements: Vec<ThroughputMeasurement>,
     #[serde(flatten)]
     pub metadata: BTreeMap<String, serde_json::Value>,
 }
@@ -17,8 +19,9 @@ pub struct RecipeCatalog {
 pub struct FamilyRecipe {
     pub parent_model: String,
     #[serde(default)]
-    pub args: Vec<String>,
+    pub parent_revision: Option<String>,
     #[serde(default)]
+    pub args: Vec<String>,
     pub arms: BTreeMap<String, RecipeArm>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -29,13 +32,12 @@ pub struct FamilyRecipe {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RecipeArm {
     #[serde(default)]
+    pub parent_model: Option<String>,
+    #[serde(default)]
+    pub parent_revision: Option<String>,
+    pub classes: BTreeMap<String, GpuRecipe>,
+    #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
-    pub gpus: Vec<String>,
-    #[serde(default)]
-    pub recipe_tp: BTreeMap<String, Vec<u32>>,
-    #[serde(default)]
-    pub gpu_overrides: BTreeMap<String, GpuRecipe>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(flatten)]
@@ -44,10 +46,45 @@ pub struct RecipeArm {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GpuRecipe {
+    pub tp: Vec<u32>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// Raw run counters belong to one model, serving topology and provider SKU.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThroughputMeasurement {
+    pub family: String,
+    pub arm: String,
+    pub gpu_class: String,
+    pub tp: u32,
+    pub replicas: u32,
+    pub allocated_gpu_count: u32,
+    pub provider: String,
+    pub provider_sku: String,
+    pub region: String,
+    pub concurrency: u32,
+    pub model: String,
+    pub revision: String,
+    pub weights_manifest_sha256: String,
+    pub image: String,
+    pub measured_at: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub elapsed_ms: u64,
+    pub raw_result_uri: String,
+    pub raw_result_sha256: String,
+}
+
+impl ThroughputMeasurement {
+    pub fn output_tokens_per_second(&self) -> Option<f64> {
+        (self.elapsed_ms > 0 && self.output_tokens > 0)
+            .then(|| self.output_tokens as f64 * 1000.0 / self.elapsed_ms as f64)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +95,7 @@ pub struct ResolvedRecipe {
     pub gpu_class: Option<String>,
     pub env: BTreeMap<String, String>,
     pub model: String,
+    pub revision: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -68,36 +106,53 @@ impl RecipeCatalog {
 
     pub fn from_json(json: &str) -> Result<Self> {
         let catalog: Self = serde_json::from_str(json)?;
-        let digest = catalog
-            .image
-            .rsplit_once("@sha256:")
-            .map(|(_, digest)| digest);
         ensure!(
-            digest.is_some_and(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit())),
+            catalog
+                .image
+                .rsplit_once("@sha256:")
+                .is_some_and(|(_, d)| is_digest(d, 64)),
             "engine recipe image must be pinned by sha256 digest"
         );
+        ensure!(
+            !catalog.metadata.contains_key("gpus"),
+            "GPU facts belong to the SDK catalog"
+        );
+        for row in &catalog.measurements {
+            let plan = catalog.resolve_for(
+                &row.family,
+                Some(&row.model),
+                &row.arm,
+                Some(&row.gpu_class),
+                row.tp,
+            )?;
+            ensure!(
+                row.replicas > 0 && row.concurrency > 0
+                    && row.tp.checked_mul(row.replicas).is_some_and(|n| n <= row.allocated_gpu_count)
+                    && row.output_tokens_per_second().is_some(),
+                "measurement requires a positive, fully allocated serving topology and raw counters"
+            );
+            ensure!(
+                row.image == catalog.image
+                    && plan
+                        .revision
+                        .as_ref()
+                        .is_none_or(|revision| revision == &row.revision)
+                    && is_digest(&row.weights_manifest_sha256, 64)
+                    && is_digest(&row.raw_result_sha256, 64)
+                    && (is_digest(&row.revision, 40) || is_digest(&row.revision, 64))
+                    && [
+                        &row.provider,
+                        &row.provider_sku,
+                        &row.region,
+                        &row.measured_at,
+                        &row.raw_result_uri
+                    ]
+                    .iter()
+                    .all(|s| !s.trim().is_empty()),
+                "measurement requires immutable model, engine, manifest and raw-result provenance"
+            );
+        }
         Ok(catalog)
-    }
-
-    /// Resolve the family's declared default node shape for planning.
-    pub fn resolve(&self, family: &str, model: Option<&str>) -> Result<ResolvedRecipe> {
-        let recipe = self.families.get(family).context("unknown model family")?;
-        let shape = recipe
-            .metadata
-            .get("default_shape")
-            .and_then(|v| v.as_str())
-            .and_then(|v| v.rsplit_once('-'));
-        let parallelism = shape
-            .map(|(_, count)| count.parse())
-            .transpose()?
-            .unwrap_or(1);
-        self.resolve_for(
-            family,
-            model,
-            "native",
-            shape.map(|(gpu, _)| gpu),
-            parallelism,
-        )
     }
 
     pub fn resolve_for(
@@ -113,64 +168,51 @@ impl RecipeCatalog {
             .families
             .get(family)
             .with_context(|| format!("unknown model family: {family}"))?;
-        let model = model.unwrap_or(&recipe.parent_model);
+        let selected = recipe
+            .arms
+            .get(arm)
+            .with_context(|| format!("unknown quantization arm: {arm}"))?;
+        let gpu_class = gpu_class.context("gpu_class requires an exact SDK catalog id")?;
+        let gpu = selected
+            .classes
+            .get(gpu_class)
+            .with_context(|| format!("unsupported GPU class for {family}/{arm}: {gpu_class}"))?;
+        ensure!(
+            gpu.tp.contains(&parallelism),
+            "unsupported tensor parallelism for {family}/{arm}/{gpu_class}"
+        );
+        let parent = selected
+            .parent_model
+            .as_deref()
+            .unwrap_or(&recipe.parent_model);
+        let model = model.unwrap_or(parent);
         ensure!(
             !model.is_empty() && !model.starts_with('-'),
             "invalid model id or path"
         );
-        let mut args = self.common_args.clone();
-        args.extend(recipe.args.iter().cloned());
-        let mut env = recipe.env.clone();
-        if recipe.arms.is_empty() {
-            ensure!(arm == "native", "unknown quantization arm: {arm}");
+        let revision = if model != parent {
+            None
+        } else if selected.parent_model.is_some() {
+            selected.parent_revision.clone()
         } else {
-            let selected = recipe
-                .arms
-                .get(arm)
-                .with_context(|| format!("unknown quantization arm: {arm}"))?;
-            let gpu = if selected.gpus.is_empty() {
-                ensure!(
-                    selected.gpu_overrides.is_empty(),
-                    "GPU overlay lacks supported hardware"
-                );
-                None
-            } else {
-                let requested =
-                    gpu_class.context("gpu_class is required for this family recipe")?;
-                let requested = requested.strip_prefix("nvidia-").unwrap_or(requested);
-                Some(
-                    selected
-                        .gpus
-                        .iter()
-                        .find(|gpu| gpu.eq_ignore_ascii_case(requested))
-                        .with_context(|| {
-                            format!("unsupported GPU class for {family}/{arm}: {requested}")
-                        })?,
-                )
-            };
-            if let Some(gpu) = gpu {
-                let choices = selected
-                    .recipe_tp
-                    .get(gpu)
-                    .context("GPU has no supported tensor parallel recipe")?;
-                ensure!(
-                    choices.contains(&parallelism),
-                    "unsupported tensor parallelism for {family}/{arm}/{gpu}"
-                );
-                if let Some(overlay) = selected.gpu_overrides.get(gpu) {
-                    args.extend(selected.args.iter().cloned());
-                    args.extend(overlay.args.iter().cloned());
-                    env.extend(selected.env.clone());
-                    env.extend(overlay.env.clone());
-                } else {
-                    args.extend(selected.args.iter().cloned());
-                    env.extend(selected.env.clone());
-                }
-            } else {
-                args.extend(selected.args.iter().cloned());
-                env.extend(selected.env.clone());
-            }
-        }
+            selected
+                .parent_revision
+                .as_ref()
+                .or(recipe.parent_revision.as_ref())
+                .cloned()
+        };
+        let mut args = self.common_args.clone();
+        args.extend(
+            recipe
+                .args
+                .iter()
+                .chain(&selected.args)
+                .chain(&gpu.args)
+                .cloned(),
+        );
+        let mut env = recipe.env.clone();
+        env.extend(selected.env.clone());
+        env.extend(gpu.env.clone());
         for value in args.iter_mut().chain(env.values_mut()) {
             *value = value.replace("{tp}", &parallelism.to_string());
             ensure!(
@@ -190,16 +232,24 @@ impl RecipeCatalog {
             "--tp",
             &parallelism.to_string(),
         );
+        if let Some(revision) = &revision {
+            set_option(&mut args, &["--revision"], "--revision", revision);
+        }
         Ok(ResolvedRecipe {
             image: self.image.clone(),
             family: family.into(),
             arm: arm.into(),
-            gpu_class: gpu_class.map(str::to_owned),
+            gpu_class: Some(gpu_class.into()),
             env,
             model: model.into(),
+            revision,
             args,
         })
     }
+}
+
+fn is_digest(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub(crate) fn set_option(args: &mut Vec<String>, aliases: &[&str], flag: &str, value: &str) {

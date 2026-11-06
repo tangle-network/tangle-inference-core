@@ -27,11 +27,23 @@ fn option<'a>(argv: &'a [String], flag: &str) -> &'a str {
 #[test]
 fn catalog_exports_real_family_recipes_and_sglang_argv() -> anyhow::Result<()> {
     let catalog = RecipeCatalog::bundled()?;
-    let glm = catalog.resolve("glm-5.3", Some("acme/derived-glm"))?;
+    let glm = catalog.resolve_for(
+        "glm-5.3",
+        Some("acme/derived-glm"),
+        "native",
+        Some("nvidia-h200"),
+        8,
+    )?;
     assert!(glm.image.contains("@sha256:"));
     assert_eq!(option(&glm.args, "--model-path"), "acme/derived-glm");
     assert_eq!(option(&glm.args, "--tp"), "8");
-    let deepseek = catalog.resolve("deepseek-v4.1-flash-1017", None)?;
+    let deepseek = catalog.resolve_for(
+        "deepseek-v4.1-flash-1017",
+        None,
+        "native",
+        Some("nvidia-h200"),
+        8,
+    )?;
     assert_eq!(option(&deepseek.args, "--moe-runner-backend"), "marlin");
     assert_eq!(option(&deepseek.args, "--attention-backend"), "dsv4");
     assert_eq!(option(&deepseek.args, "--ep-size"), "1");
@@ -39,7 +51,9 @@ fn catalog_exports_real_family_recipes_and_sglang_argv() -> anyhow::Result<()> {
         option(&deepseek.args, "--model-path"),
         "deepseek-ai/DeepSeek-V4.1-Flash-1017"
     );
-    assert!(catalog.resolve("unknown-family", None).is_err());
+    assert!(catalog
+        .resolve_for("unknown-family", None, "native", Some("nvidia-h200"), 8)
+        .is_err());
 
     let cfg = config(EngineKind::Sglang);
     let argv = cfg.argv()?;
@@ -100,7 +114,6 @@ async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
             cfg.model = "acme/derived-deepseek".into();
         }
         cfg.command = format!("python3 {} {}", script.display(), receipt.display());
-        cfg.hf_token = Some("test-only-token".into());
         cfg.download_dir = Some(dir.path().join("model cache"));
         let model = cfg.model.clone();
         let process = Arc::new(EngineProcess::spawn(cfg).await?);
@@ -130,7 +143,7 @@ async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
             option(&argv, "--download-dir"),
             dir.path().join("model cache").to_str().unwrap()
         );
-        assert_eq!(receipt["token_in_env"], true);
+        assert_eq!(receipt["token_in_env"], false);
         if engine == EngineKind::Sglang {
             assert_eq!(receipt["hopper_env"], "0");
         }

@@ -44,8 +44,6 @@ pub struct EngineConfig {
     /// Explicit executable plus initial arguments; never evaluated by a shell.
     #[serde(default)]
     pub command: String,
-    #[serde(default, skip_serializing)]
-    pub hf_token: Option<String>,
     #[serde(default)]
     pub download_dir: Option<PathBuf>,
     #[serde(default = "default_timeout")]
@@ -99,7 +97,6 @@ impl Default for EngineConfig {
             tensor_parallel_size: default_parallelism(),
             extra_args: Vec::new(),
             command: String::new(),
-            hf_token: None,
             download_dir: None,
             startup_timeout_secs: default_timeout(),
             external: false,
@@ -267,6 +264,23 @@ impl EngineProcess {
         let argv = self.config.argv()?;
         let mut command = Command::new(&argv[0]);
         command
+            .env_clear()
+            .envs(
+                [
+                    "PATH",
+                    "LD_LIBRARY_PATH",
+                    "CUDA_HOME",
+                    "CUDA_PATH",
+                    "CUDA_VISIBLE_DEVICES",
+                    "NVIDIA_VISIBLE_DEVICES",
+                    "NVIDIA_DRIVER_CAPABILITIES",
+                    "NCCL_SOCKET_IFNAME",
+                    "NCCL_IB_HCA",
+                    "TMPDIR",
+                ]
+                .into_iter()
+                .filter_map(|key| std::env::var_os(key).map(|value| (key, value))),
+            )
             .args(&argv[1..])
             .kill_on_drop(true)
             .stdin(Stdio::null())
@@ -276,9 +290,6 @@ impl EngineProcess {
         command.process_group(0);
         if self.config.engine == EngineKind::Sglang {
             command.envs(self.config.recipe()?.env);
-        }
-        if let Some(token) = &self.config.hf_token {
-            command.env("HF_TOKEN", token);
         }
         let mut child = command.spawn().context("failed to start serving engine")?;
         for (stream, pipe) in
@@ -298,13 +309,9 @@ impl EngineProcess {
             ]
         {
             if let Some(pipe) = pipe {
-                let token = self.config.hf_token.clone();
                 tokio::spawn(async move {
                     let mut lines = BufReader::new(pipe).lines();
-                    while let Ok(Some(mut line)) = lines.next_line().await {
-                        if let Some(token) = token.as_ref().filter(|token| !token.is_empty()) {
-                            line = line.replace(token, "[REDACTED]");
-                        }
+                    while let Ok(Some(line)) = lines.next_line().await {
                         tracing::info!(target: "engine", stream, "{line}");
                     }
                 });

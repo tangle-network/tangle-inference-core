@@ -7,12 +7,8 @@ use prometheus::{
     Registry, TextEncoder,
 };
 
-// Global registry + startup time
-
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::default);
 static STARTED_AT: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-// Request metrics
 
 pub static REQUEST_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let c = IntCounterVec::new(
@@ -60,18 +56,6 @@ pub static MAX_CONCURRENT_REQUESTS: LazyLock<Gauge> = LazyLock::new(|| {
     g
 });
 
-pub static QUEUE_DEPTH: LazyLock<Gauge> = LazyLock::new(|| {
-    let g = Gauge::new(
-        "tangle_operator_queue_depth",
-        "Requests waiting for a concurrency slot",
-    )
-    .expect("metric");
-    REGISTRY.register(Box::new(g.clone())).expect("register");
-    g
-});
-
-// Token throughput metrics
-
 pub static TOKENS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let c = IntCounterVec::new(
         Opts::new("tangle_operator_tokens_total", "LLM tokens processed"),
@@ -95,8 +79,6 @@ pub static TOKENS_PER_SECOND: LazyLock<GaugeVec> = LazyLock::new(|| {
     g
 });
 
-// Latency breakdown metrics
-
 pub static TIME_TO_FIRST_TOKEN: LazyLock<HistogramVec> = LazyLock::new(|| {
     let h = HistogramVec::new(
         HistogramOpts::new(
@@ -113,8 +95,6 @@ pub static TIME_TO_FIRST_TOKEN: LazyLock<HistogramVec> = LazyLock::new(|| {
     h
 });
 
-// Error rate by type
-
 pub static ERROR_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let c = IntCounterVec::new(
         Opts::new("tangle_operator_errors_total", "Errors by type"),
@@ -124,8 +104,6 @@ pub static ERROR_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     REGISTRY.register(Box::new(c.clone())).expect("register");
     c
 });
-
-// GPU utilization metrics
 
 pub static GPU_UTILIZATION: LazyLock<GaugeVec> = LazyLock::new(|| {
     let g = GaugeVec::new(
@@ -179,23 +157,6 @@ pub static GPU_TEMPERATURE: LazyLock<GaugeVec> = LazyLock::new(|| {
     g
 });
 
-// Model status
-
-pub static MODEL_STATUS: LazyLock<GaugeVec> = LazyLock::new(|| {
-    let g = GaugeVec::new(
-        Opts::new(
-            "tangle_operator_model_status",
-            "Model status (1=running, 0=stopped)",
-        ),
-        &["model"],
-    )
-    .expect("metric");
-    REGISTRY.register(Box::new(g.clone())).expect("register");
-    g
-});
-
-// Heartbeat / uptime
-
 pub static HEARTBEATS_SENT: LazyLock<IntCounter> = LazyLock::new(|| {
     let c = IntCounter::new(
         "tangle_operator_heartbeats_total",
@@ -216,8 +177,6 @@ pub static HEARTBEATS_FAILED: LazyLock<IntCounter> = LazyLock::new(|| {
     c
 });
 
-// Atomic counters for on-chain submission
-
 static TOTAL_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_ERROR: AtomicU64 = AtomicU64::new(0);
 static TOTAL_TIMEOUT: AtomicU64 = AtomicU64::new(0);
@@ -229,8 +188,6 @@ static TOKENS_PROMPTED: AtomicU64 = AtomicU64::new(0);
 static PEAK_CONCURRENT: AtomicU64 = AtomicU64::new(0);
 static TTFT_SUM_MS: AtomicU64 = AtomicU64::new(0);
 static TTFT_COUNT: AtomicU64 = AtomicU64::new(0);
-
-// Request guard -- RAII tracking
 
 /// RAII guard that tracks request lifecycle metrics. Create at request start,
 /// set tokens/success/timeout during processing, metrics recorded on drop.
@@ -278,16 +235,9 @@ impl RequestGuard {
     }
 
     /// Record time-to-first-token in milliseconds.
-    pub fn set_ttft(&mut self, ttft_ms: u64) {
-        self.ttft_ms = Some(ttft_ms);
-    }
 
     pub fn set_success(&mut self) {
         self.success = true;
-    }
-
-    pub fn set_timeout(&mut self) {
-        self.timed_out = true;
     }
 
     /// Record a typed error for fine-grained error tracking.
@@ -360,8 +310,6 @@ impl Drop for RequestGuard {
     }
 }
 
-// Prometheus text output
-
 /// Gather all registered metrics as Prometheus text exposition format.
 pub fn gather() -> String {
     let encoder = TextEncoder::new();
@@ -370,8 +318,6 @@ pub fn gather() -> String {
     encoder.encode(&families, &mut buf).unwrap_or_default();
     String::from_utf8(buf).unwrap_or_default()
 }
-
-// On-chain metrics (for QoS submission)
 
 /// Snapshot of key metrics for on-chain QoS submission.
 /// Values are designed for uint256 encoding (basis points for rates).
@@ -436,8 +382,6 @@ pub fn on_chain_metrics() -> Vec<(String, u64)> {
         ("uptime_seconds".into(), uptime_secs),
     ]
 }
-
-// Health JSON (for platform health checker)
 
 /// JSON summary of operator health for dashboards and monitoring.
 pub fn health_summary() -> serde_json::Value {
