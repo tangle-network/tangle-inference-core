@@ -151,8 +151,9 @@ if not a.active:
     os.execv(a.second,[a.second,__file__]+sys.argv[1:]+['--active'])
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body={'data':[{'id':'fixture/runtime-model'}]} if self.path=='/v1/models' else {'version':'exec-image-two'}
-        self.send_response(200);self.end_headers();self.wfile.write(json.dumps(body).encode())
+        value={'data':[{'id':'fixture/runtime-model'}]} if self.path=='/v1/models' else {'version':'exec-image-two'}
+        body=b'' if self.path=='/health' else json.dumps(value).encode()
+        self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
     def log_message(self,*args):pass
 http.server.HTTPServer((a.host,a.port),H).serve_forever()
 "#,
@@ -190,6 +191,7 @@ http.server.HTTPServer((a.host,a.port),H).serve_forever()
                         .send().await?.error_for_status()?;
                     samples += 1;
                     false_health += usize::from(!healthy);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
         }
