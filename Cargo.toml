@@ -34,6 +34,9 @@ prometheus = { version = "0.13", default-features = false, optional = true }
 # Always required for HTTP client (health checks, billing RPC)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 futures = "0.3"
@@ -41,3 +44,8 @@ futures = "0.3"
 [[example]]
 name = "minimal_operator"
 path = "examples/minimal_operator.rs"
+
+[[example]]
+name = "sign_spend_auth"
+path = "examples/sign_spend_auth.rs"
+required-features = ["billing", "http"]

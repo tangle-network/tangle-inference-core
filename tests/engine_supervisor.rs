@@ -1,4 +1,4 @@
-use std::{net::TcpListener, path::PathBuf, time::Duration};
+use std::{net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 use tangle_inference_core::engine::{EngineConfig, EngineKind, EngineProcess, RecipeCatalog};
 
 fn config(engine: EngineKind) -> EngineConfig {
@@ -31,10 +31,16 @@ fn catalog_exports_real_family_recipes_and_sglang_argv() -> anyhow::Result<()> {
     assert_eq!(option(&glm.args, "--model-path"), "acme/derived-glm");
     assert_eq!(option(&glm.args, "--tp"), "8");
     let deepseek = catalog.resolve("deepseek-v4.1-flash-1017", None)?;
-    assert_eq!(option(&deepseek.args, "--moe-runner-backend"), "flashinfer_mxfp4");
+    assert_eq!(
+        option(&deepseek.args, "--moe-runner-backend"),
+        "flashinfer_mxfp4"
+    );
     assert_eq!(option(&deepseek.args, "--attention-backend"), "dsv4");
     assert_eq!(option(&deepseek.args, "--ep-size"), "8");
-    assert_eq!(option(&deepseek.args, "--model-path"), "deepseek-ai/DeepSeek-V4.1-Flash-1017");
+    assert_eq!(
+        option(&deepseek.args, "--model-path"),
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    );
     assert!(catalog.resolve("unknown-family", None).is_err());
 
     let cfg = config(EngineKind::Sglang);
@@ -50,7 +56,10 @@ fn catalog_exports_real_family_recipes_and_sglang_argv() -> anyhow::Result<()> {
     assert!(invalid.argv().is_err());
     invalid.engine = EngineKind::Vllm;
     let argv = invalid.argv()?;
-    assert_eq!(&argv[..3], ["python3", "-m", "vllm.entrypoints.openai.api_server"]);
+    assert_eq!(
+        &argv[..3],
+        ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+    );
     assert_eq!(option(&argv, "--max-model-len"), "4096");
     assert_eq!(option(&argv, "--tensor-parallel-size"), "1");
     Ok(())
@@ -59,7 +68,9 @@ fn catalog_exports_real_family_recipes_and_sglang_argv() -> anyhow::Result<()> {
 fn child_script(dir: &std::path::Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let script = dir.join("engine.py");
     let receipt = dir.join("argv.json");
-    std::fs::write(&script, r#"
+    std::fs::write(
+        &script,
+        r#"
 import argparse, http.server, json, os, sys
 p = argparse.ArgumentParser()
 p.add_argument("receipt")
@@ -70,11 +81,13 @@ with open(a.receipt, "w") as f:
     json.dump({"args": sys.argv[2:], "token_in_env": os.environ.get("HF_TOKEN") == "test-only-token"}, f)
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/crash": os._exit(42)
         self.send_response(200 if self.path == "/health" else 404)
         self.end_headers()
     def log_message(self, *args): pass
 http.server.HTTPServer((a.host, a.port), Handler).serve_forever()
-"#)?;
+"#,
+    )?;
     Ok((script, receipt))
 }
 
@@ -88,14 +101,33 @@ async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
         cfg.hf_token = Some("test-only-token".into());
         cfg.download_dir = Some(dir.path().join("model cache"));
         let model = cfg.model.clone();
-        let process = EngineProcess::spawn(cfg).await?;
+        let process = Arc::new(EngineProcess::spawn(cfg).await?);
         process.wait_ready().await?;
         assert!(process.is_healthy().await);
-        assert!(process.client().get(format!("{}/health", process.endpoint())).send().await?.status().is_success());
+        assert!(process
+            .client()
+            .get(format!("{}/health", process.endpoint()))
+            .send()
+            .await?
+            .status()
+            .is_success());
         let receipt: serde_json::Value = serde_json::from_slice(&std::fs::read(receipt)?)?;
         let argv: Vec<String> = serde_json::from_value(receipt["args"].clone())?;
-        assert_eq!(option(&argv, if engine == EngineKind::Sglang { "--model-path" } else { "--model" }), model);
-        assert_eq!(option(&argv, "--download-dir"), dir.path().join("model cache").to_str().unwrap());
+        assert_eq!(
+            option(
+                &argv,
+                if engine == EngineKind::Sglang {
+                    "--model-path"
+                } else {
+                    "--model"
+                }
+            ),
+            model
+        );
+        assert_eq!(
+            option(&argv, "--download-dir"),
+            dir.path().join("model cache").to_str().unwrap()
+        );
         assert_eq!(receipt["token_in_env"], true);
         assert!(!argv.iter().any(|arg| arg.contains("test-only-token")));
         process.restart().await?;
@@ -103,6 +135,24 @@ async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
         process.shutdown().await;
         assert!(!process.is_healthy().await);
         process.shutdown().await;
+        process.restart().await?;
+        let _ = process
+            .client()
+            .get(format!("{}/crash", process.endpoint()))
+            .send()
+            .await;
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervised = process.clone();
+        let task = tokio::spawn(async move { supervised.supervise(shutdown_rx).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !process.is_healthy().await {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await?;
+        shutdown.send(true)?;
+        task.await??;
+        assert!(!process.is_healthy().await);
     }
     Ok(())
 }

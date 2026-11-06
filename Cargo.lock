@@ -3892,6 +3892,7 @@ dependencies = [
  "futures",
  "hex",
  "k256",
+ "libc",
  "prometheus",
  "reqwest 0.12.28",
  "serde",

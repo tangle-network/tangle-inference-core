@@ -1,0 +1,26 @@
+{
+  "image": "lmsysorg/sglang:v0.5.23-cu130@sha256:f832b5c39559c9caa900b22ad37c76fcce66470676855c42052102c537812f1f",
+  "common_args": ["--host", "0.0.0.0", "--port", "8000", "--tp", "8", "--mem-fraction-static", "0.8", "--context-length", "32768", "--enable-cache-report", "--reasoning-parser", "auto", "--tool-call-parser", "auto"],
+  "families": {
+    "glm-5.3": {
+      "parent_model": "zai-org/GLM-5.3",
+      "architecture": "GlmMoeDsaForCausalLM",
+      "license": "GLM-5.3 custom commercial license; preserve notices and review the >$10B affiliate MaaS condition",
+      "license_url": "https://huggingface.co/zai-org/GLM-5.3/blob/main/LICENSE",
+      "precision": "Shipped FP8 e4m3 block128; no requantization",
+      "quantization": {"quant_method": "fp8", "weight_block_size": [128, 128]},
+      "args": [],
+      "recipe": "https://github.com/sgl-project/sglang/blob/v0.5.23/docs/cookbook/autoregressive/GLM/GLM-5.3.mdx"
+    },
+    "deepseek-v4.1-flash-1017": {
+      "parent_model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "architecture": "DeepseekV41ForCausalLM",
+      "license": "MIT; preserve copyright and license notices",
+      "license_url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/main/LICENSE",
+      "precision": "Shipped FP8 dynamic block32 with ue8m0 scales and FP4 experts; preserve packed tensors",
+      "quantization": {"quant_method": "fp8", "weight_block_size": [32, 32], "scale_fmt": "ue8m0", "expert_dtype": "fp4"},
+      "args": ["--ep-size", "8", "--attention-backend", "dsv4", "--moe-runner-backend", "flashinfer_mxfp4", "--cuda-graph-max-bs-decode", "64"],
+      "recipe": "https://github.com/sgl-project/sglang/blob/v0.5.23/docs/src/snippets/configs/deepseek-ai/deepseek-v4_1.jsx"
+    }
+  }
+}

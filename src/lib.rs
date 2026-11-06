@@ -1,6 +1,11 @@
 pub mod config;
+pub mod engine;
 pub mod health;
+pub mod operator;
 pub mod settlement_queue;
+
+#[cfg(all(feature = "billing", feature = "metrics"))]
+pub mod qos;
 
 #[cfg(feature = "billing")]
 pub mod billing;
