@@ -111,5 +111,80 @@ async fn runtime_identity_follows_own_running_inodes() -> Result<()> {
         .unwrap();
     let observed: Option<String> = serde_json::from_str(&own)?;
     assert_eq!(observed.as_deref(), Some(expected));
+    // A launcher may exec a different image without changing its supervised PID.
+    use tangle_inference_core::engine::{EngineConfig, EngineProcess};
+    let python = Command::new("python3")
+        .args([
+            "-c",
+            "import os,sys; print(os.path.realpath(sys.executable))",
+        ])
+        .output()
+        .await?;
+    assert!(python.status.success());
+    let second_python = directory.path().join("python-second");
+    std::fs::copy(std::str::from_utf8(&python.stdout)?.trim(), &second_python)?;
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&second_python)?
+            .write_all(b"review fixture: distinct executable bytes\n")?;
+    }
+    let switch = directory.path().join("switch");
+    let peer = directory.path().join("exec-peer.py");
+    std::fs::write(
+        &peer,
+        r#"import argparse,http.server,json,os,sys,time
+p=argparse.ArgumentParser()
+p.add_argument('switch');p.add_argument('second');p.add_argument('--active',action='store_true')
+p.add_argument('--host');p.add_argument('--port',type=int)
+a,_=p.parse_known_args()
+if not a.active:
+    while not os.path.exists(a.switch):time.sleep(.01)
+    os.execv(a.second,[a.second,__file__]+sys.argv[1:]+['--active'])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body={'data':[{'id':'fixture/runtime-model'}]} if self.path=='/v1/models' else {'version':'exec-image-two'}
+        self.send_response(200);self.end_headers();self.wfile.write(json.dumps(body).encode())
+    def log_message(self,*args):pass
+http.server.HTTPServer((a.host,a.port),H).serve_forever()
+"#,
+    )?;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let process = EngineProcess::spawn(EngineConfig {
+        model: "fixture/runtime-model".into(),
+        port,
+        startup_timeout_secs: 5,
+        command: format!(
+            "python3 {} {} {}",
+            peer.display(),
+            switch.display(),
+            second_python.display()
+        ),
+        ..Default::default()
+    })
+    .await?;
+    std::fs::write(&switch, b"exec now")?;
+    process.wait_ready().await?;
+    let facts = process.runtime_info().await?;
+    let pid = facts["processes"][0]["pid"].as_u64().unwrap();
+    let actual_executable = std::fs::read(format!("/proc/{pid}/exe"))?;
+    let actual_argv = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    let expected = serde_json::json!({
+        "executable_sha256":format!("{:x}",Sha256::digest(actual_executable)),
+        "argv_sha256":format!("{:x}",Sha256::digest(actual_argv)),
+    });
+    let observed = serde_json::json!({
+        "executable_sha256":facts["processes"][0]["executable_sha256"],
+        "argv_sha256":facts["processes"][0]["argv_sha256"],
+    });
+    process.shutdown().await;
+    assert_eq!(facts["ready"], true);
+    assert_eq!(
+        observed, expected,
+        "runtime identity retained the pre-exec launcher fingerprint"
+    );
     Ok(())
 }
