@@ -5,7 +5,10 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tangle_inference_core::weights::{stage_weights, StagingLimits, WeightSource};
+use tangle_inference_core::{
+    engine::{EngineConfig, EngineProcess},
+    weights::{stage_weights, StagingLimits, WeightSource},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -146,77 +149,70 @@ fn assert_empty(path: &std::path::Path) {
     );
 }
 
+async fn reject(
+    url: &str,
+    source: &WeightSource,
+    destination: &std::path::Path,
+    limits: &StagingLimits,
+) {
+    let result = stage_weights(url, source, destination, limits).await;
+    assert!(
+        result.is_err(),
+        "staging unexpectedly succeeded: {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn whole_manifest_is_checked_before_any_shard_fetch() {
     let origin = Origin::start().await;
     let limits = fixture_limits();
     let destination = tempfile::tempdir().unwrap();
-    for path in [
+    let mut cases: Vec<_> = [
         "../escape.bin",
         "a/../escape.bin",
         "/absolute.bin",
         r"C:\outside.bin",
         ".tangle-weights-manifest.json",
-    ] {
-        let source = origin.manifest(serde_json::json!([origin.file(path)]), 5);
-        assert!(
-            stage_weights(
-                &format!("{}/manifest", origin.url),
-                &source,
-                destination.path(),
-                &limits
-            )
-            .await
-            .is_err(),
-            "accepted {path}"
-        );
-        assert_eq!(origin.take_requests(), ["/manifest"]);
-        assert_empty(destination.path());
-    }
-    for files in [
-        serde_json::json!([origin.file("same"), origin.file("same")]),
-        serde_json::json!([origin.file("parent"), origin.file("parent/child")]),
-    ] {
-        let source = origin.manifest(files, 10);
-        assert!(stage_weights(
+    ]
+    .into_iter()
+    .map(|path| (serde_json::json!([origin.file(path)]), 5))
+    .collect();
+    cases.extend([
+        (
+            serde_json::json!([origin.file("same"), origin.file("same")]),
+            10,
+        ),
+        (
+            serde_json::json!([origin.file("parent"), origin.file("parent/child")]),
+            10,
+        ),
+        (serde_json::json!([origin.file("weights.bin")]), 6),
+    ]);
+    for (files, size) in cases {
+        let source = origin.manifest(files, size);
+        reject(
             &format!("{}/manifest", origin.url),
             &source,
             destination.path(),
-            &limits
+            &limits,
         )
-        .await
-        .is_err());
+        .await;
         assert_eq!(origin.take_requests(), ["/manifest"]);
         assert_empty(destination.path());
     }
-    let mut source = origin.manifest(serde_json::json!([origin.file("weights.bin")]), 5);
-    source.size_bytes = 6;
-    assert!(stage_weights(
-        &format!("{}/manifest", origin.url),
-        &source,
-        destination.path(),
-        &limits
-    )
-    .await
-    .is_err());
-    assert_eq!(origin.take_requests(), ["/manifest"]);
-    source.size_bytes = 5;
+    let source = origin.manifest(serde_json::json!([origin.file("weights.bin")]), 5);
     let mut manifest =
         serde_json::to_vec(&serde_json::json!({"version":1,"files":[origin.file("weights.bin")]}))
             .unwrap();
     manifest.push(b' ');
     origin.serve("/manifest", manifest);
-    assert!(
-        stage_weights(
-            &format!("{}/manifest", origin.url),
-            &source,
-            destination.path(),
-            &limits
-        )
-        .await
-        .is_err(),
-        "accepted changed raw manifest bytes"
-    );
+    reject(
+        &format!("{}/manifest", origin.url),
+        &source,
+        destination.path(),
+        &limits,
+    )
+    .await;
     assert_eq!(origin.take_requests(), ["/manifest"]);
     assert_empty(destination.path());
 }
@@ -235,9 +231,7 @@ async fn origin_policy_and_byte_limits_refuse_downloads_before_publication() {
             ..fixture_limits()
         },
     ] {
-        assert!(stage_weights(&url, &source, destination.path(), &limits)
-            .await
-            .is_err());
+        reject(&url, &source, destination.path(), &limits).await;
         assert!(origin.take_requests().is_empty());
         assert_empty(destination.path());
     }
@@ -245,9 +239,7 @@ async fn origin_policy_and_byte_limits_refuse_downloads_before_publication() {
         max_manifest_bytes: 8,
         ..fixture_limits()
     };
-    assert!(stage_weights(&url, &source, destination.path(), &limits)
-        .await
-        .is_err());
+    reject(&url, &source, destination.path(), &limits).await;
     assert_eq!(origin.take_requests(), ["/manifest"]);
     let source = origin.manifest(
         serde_json::json!([origin.file("one"), origin.file("two")]),
@@ -257,18 +249,33 @@ async fn origin_policy_and_byte_limits_refuse_downloads_before_publication() {
         max_files: 1,
         ..fixture_limits()
     };
-    assert!(stage_weights(&url, &source, destination.path(), &limits)
-        .await
-        .is_err());
+    reject(&url, &source, destination.path(), &limits).await;
     assert_eq!(origin.take_requests(), ["/manifest"]);
     assert_empty(destination.path());
 }
 
 #[tokio::test]
-async fn tampered_truncated_and_oversized_shards_leave_no_partial_model() {
+async fn invalid_shards_prevent_staging_and_engine_child_start() {
     let origin = Origin::start().await;
     let source = origin.manifest(serde_json::json!([origin.file("weights.bin")]), 5);
     let destination = tempfile::tempdir().unwrap();
+    let child = tempfile::tempdir().unwrap();
+    let script = child.path().join("engine.py");
+    let marker = child.path().join("spawned");
+    std::fs::write(
+        &script,
+        "import pathlib,sys\npathlib.Path(sys.argv[1]).write_text('spawned')\n",
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let config: EngineConfig = serde_json::from_value(serde_json::json!({
+        "model":"acme/derived", "command":format!("python3 {} {}",script.display(),marker.display()),
+        "port":port, "startup_timeout_secs":1,
+        "weights":{"manifest_url":format!("{}/manifest",origin.url),"manifestSha":source.manifest_sha,
+            "sizeBytes":source.size_bytes,"cache_dir":destination.path(),"allow_loopback_http":true}
+    })).unwrap();
     for wire in [
         b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO".to_vec(),
         b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhe".to_vec(),
@@ -276,6 +283,14 @@ async fn tampered_truncated_and_oversized_shards_leave_no_partial_model() {
     ] {
         origin.reply("/weights",wire,false,None);
         assert!(stage_weights(&format!("{}/manifest",origin.url),&source,destination.path(),&fixture_limits()).await.is_err());
+        assert_eq!(origin.take_requests(),["/manifest","/weights"]);
+        assert_empty(destination.path());
+        let refused = match EngineProcess::spawn(config.clone()).await {
+            Err(_) => true,
+            Ok(process) => { let _ = process.wait_ready().await; process.shutdown().await; false }
+        };
+        assert!(!marker.exists(), "invalid shard reached the engine child process");
+        assert!(refused, "invalid shard did not prevent engine startup");
         assert_eq!(origin.take_requests(),["/manifest","/weights"]);
         assert_empty(destination.path());
     }
@@ -298,29 +313,17 @@ async fn cache_changes_are_refused_offline_without_repairing_or_deleting_data() 
     assert_eq!(cached.model_dir(), verified.model_dir());
     let file = verified.model_dir().join("nested/weights.bin");
     std::fs::write(&file, b"HELLO").unwrap();
-    assert!(
-        stage_weights(&url, &source, destination.path(), &fixture_limits())
-            .await
-            .is_err()
-    );
+    reject(&url, &source, destination.path(), &fixture_limits()).await;
     assert_eq!(std::fs::read(&file).unwrap(), b"HELLO");
     std::fs::write(&file, b"hello").unwrap();
     std::fs::write(verified.model_dir().join("unlisted.bin"), b"unexpected").unwrap();
-    assert!(
-        stage_weights(&url, &source, destination.path(), &fixture_limits())
-            .await
-            .is_err()
-    );
+    reject(&url, &source, destination.path(), &fixture_limits()).await;
     std::fs::remove_file(verified.model_dir().join("unlisted.bin")).unwrap();
     let manifest = verified.model_dir().join(".tangle-weights-manifest.json");
     let mut changed = std::fs::read(&manifest).unwrap();
     changed.push(b' ');
     std::fs::write(&manifest, changed).unwrap();
-    assert!(
-        stage_weights(&url, &source, destination.path(), &fixture_limits())
-            .await
-            .is_err()
-    );
+    reject(&url, &source, destination.path(), &fixture_limits()).await;
 }
 
 #[cfg(unix)]
@@ -341,11 +344,7 @@ async fn cache_and_destination_symlinks_are_never_followed() {
     let cached = verified.model_dir().join("weights.bin");
     std::fs::remove_file(&cached).unwrap();
     std::os::unix::fs::symlink(&outside_file, &cached).unwrap();
-    assert!(
-        stage_weights(&url, &source, destination.path(), &fixture_limits())
-            .await
-            .is_err()
-    );
+    reject(&url, &source, destination.path(), &fixture_limits()).await;
     let alias = destination.path().join("alias");
     std::os::unix::fs::symlink(outside.path(), &alias).unwrap();
     assert!(stage_weights(&url, &source, &alias, &fixture_limits())
