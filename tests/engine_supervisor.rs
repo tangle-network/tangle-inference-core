@@ -364,3 +364,52 @@ http.server.HTTPServer((a.host,a.port),H).serve_forever()
     assert_eq!(devices, ["0,1,2,3", "4,5,6,7"]);
     Ok(())
 }
+
+#[tokio::test]
+async fn managed_model_endpoint_stays_on_loopback() -> anyhow::Result<()> {
+    let directory = tempfile::tempdir()?;
+    let peer = directory.path().join("model.py");
+    std::fs::write(
+        &peer,
+        r#"import argparse,http.server
+p=argparse.ArgumentParser();p.add_argument('--host');p.add_argument('--port',type=int)
+a,_=p.parse_known_args()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200);self.end_headers();self.wfile.write(b'{"data":[{"id":"private-model"}]}')
+    def log_message(self,*args):pass
+http.server.HTTPServer((a.host,a.port),H).serve_forever()
+"#,
+    )?;
+    let (port, reservation) = (0..100)
+        .find_map(|_| {
+            let first = TcpListener::bind("0.0.0.0:0").ok()?;
+            let port = first.local_addr().ok()?.port();
+            let second = TcpListener::bind(("127.0.0.1", port.checked_add(1)?)).ok()?;
+            Some((port, (first, second)))
+        })
+        .ok_or_else(|| anyhow::anyhow!("no free model/router port pair"))?;
+    let mut cfg = config(EngineKind::Sglang);
+    cfg.host = "0.0.0.0".into();
+    cfg.port = port;
+    cfg.command = format!("python3 {}", peer.display());
+    cfg.router_command = cfg.command.clone();
+    drop(reservation);
+    let process = EngineProcess::spawn(cfg).await?;
+    process.wait_ready().await?;
+    // A second local interface detects wildcard binding without relying on LAN routing.
+    let direct = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()?
+        .get(format!("http://127.0.0.2:{port}/v1/models"))
+        .send()
+        .await;
+    let observed = direct.as_ref().map(|response| response.status().as_u16());
+    process.shutdown().await;
+    assert!(
+        direct.is_err(),
+        "unauthenticated model endpoint reachable on another interface: {observed:?}"
+    );
+    Ok(())
+}
