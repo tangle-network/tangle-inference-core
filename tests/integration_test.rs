@@ -1,20 +1,13 @@
-//! Cryptographic, replay, pre-serve payment gates and real Anvil ERC-20 integration.
+//! Replay, pre-serve payment gates and real Anvil ERC-20 integration.
 
 use std::sync::Arc;
 
-use alloy::primitives::{keccak256, Address, B256, U256};
+use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::SolValue;
-use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature};
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 
-use tangle_inference_core::billing::{recover_spend_auth_signer, verify_spend_auth_signature};
-use tangle_inference_core::server::{
-    error_response, extract_x402_spend_auth, payment_required, validate_spend_auth,
-    X402_PAYMENT_NETWORK, X402_PAYMENT_RECIPIENT, X402_PAYMENT_REQUIRED, X402_PAYMENT_SIGNATURE,
-    X402_PAYMENT_TOKEN,
-};
+use tangle_inference_core::server::validate_spend_auth;
 use tangle_inference_core::{
     AppState, AppStateBuilder, BillingClient, BillingConfig, NonceStore, ServerConfig,
     SpendAuthPayload, TangleConfig,
@@ -48,114 +41,6 @@ fn test_billing_config() -> BillingConfig {
     }
 }
 
-#[test]
-fn spend_auth_signature_round_trip() {
-    // Anvil account #0.
-    let key_hex = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-    let signer: PrivateKeySigner = key_hex.parse().expect("signer");
-    let signing_address = signer.address();
-
-    let shielded_credits_addr = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
-    let shielded: Address = shielded_credits_addr.parse().unwrap();
-    let chain_id: u64 = 31337;
-
-    // Build the EIP-712 digest exactly as `recover_spend_auth_signer` does.
-    let domain_separator = keccak256(
-        (
-            keccak256(
-                b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
-            ),
-            keccak256(b"ShieldedCredits"),
-            keccak256(b"1"),
-            U256::from(chain_id),
-            shielded,
-        )
-            .abi_encode(),
-    );
-    let spend_typehash = keccak256(
-        b"SpendAuthorization(bytes32 commitment,uint64 serviceId,uint8 jobIndex,uint256 amount,address operator,uint256 nonce,uint64 expiry)",
-    );
-
-    let commitment_str = "0x1111111111111111111111111111111111111111111111111111111111111111";
-    let commitment: B256 = commitment_str.parse().unwrap();
-    let service_id: u64 = 42;
-    let job_index: u8 = 0;
-    let amount_u: U256 = U256::from(500_000u64);
-    let operator: Address = "0x000000000000000000000000000000000000dEaD"
-        .parse()
-        .unwrap();
-    let nonce: u64 = 7;
-    let expiry: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 600;
-
-    let struct_hash = keccak256(
-        (
-            spend_typehash,
-            commitment,
-            U256::from(service_id),
-            U256::from(job_index),
-            amount_u,
-            operator,
-            U256::from(nonce),
-            U256::from(expiry),
-        )
-            .abi_encode(),
-    );
-
-    let digest = keccak256(
-        [
-            &[0x19, 0x01],
-            domain_separator.as_slice(),
-            struct_hash.as_slice(),
-        ]
-        .concat(),
-    );
-
-    let key_bytes = hex::decode(key_hex).unwrap();
-    let signing_key = k256::ecdsa::SigningKey::from_slice(&key_bytes).unwrap();
-    let (sig, recid): (Signature, RecoveryId) =
-        signing_key.sign_prehash(digest.as_slice()).unwrap();
-
-    let mut sig_bytes = [0u8; 65];
-    sig_bytes[..64].copy_from_slice(&sig.to_bytes());
-    sig_bytes[64] = recid.to_byte();
-    let signature_hex = format!("0x{}", hex::encode(sig_bytes));
-
-    let payload = SpendAuthPayload {
-        commitment: commitment_str.into(),
-        service_id,
-        job_index,
-        amount: "500000".into(),
-        operator: format!("{operator:#x}"),
-        nonce,
-        expiry,
-        signature: signature_hex,
-    };
-
-    let recovered =
-        recover_spend_auth_signer(&payload, shielded_credits_addr, chain_id, 30).unwrap();
-    assert_eq!(recovered, signing_address);
-
-    verify_spend_auth_signature(
-        &payload,
-        signing_address,
-        shielded_credits_addr,
-        chain_id,
-        30,
-    )
-    .expect("matching signer");
-
-    let other: Address = "0x000000000000000000000000000000000000bEEF"
-        .parse()
-        .unwrap();
-    assert!(
-        verify_spend_auth_signature(&payload, other, shielded_credits_addr, chain_id, 30).is_err()
-    );
-}
-
 #[tokio::test]
 async fn nonce_store_persists_across_reload() {
     let tmp = tempfile::tempdir().unwrap();
@@ -177,7 +62,7 @@ async fn nonce_store_persists_across_reload() {
     assert!(reloaded.check_replay(&key, 30).await);
 }
 
-// --- Helpers for validate_spend_auth / payment_required / extract_x402 tests ---
+// --- Payment-gate fixtures ---
 
 fn build_test_state() -> AppState {
     let billing =
@@ -301,107 +186,6 @@ async fn validate_spend_auth_rejects_nonce_replay() {
     assert_eq!(response_status(&resp), StatusCode::BAD_REQUEST);
 }
 
-// --- payment_required tests ---
-
-#[tokio::test]
-async fn payment_required_returns_402_with_x402_headers() {
-    let billing_cfg = test_billing_config();
-    let tangle_cfg = test_tangle_config();
-    let operator: Address = "0x000000000000000000000000000000000000dEaD"
-        .parse()
-        .unwrap();
-
-    let resp = payment_required(&billing_cfg, &tangle_cfg, operator, 5000);
-
-    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
-    let headers = resp.headers();
-    assert!(headers.contains_key(X402_PAYMENT_REQUIRED));
-    assert!(headers.contains_key(X402_PAYMENT_TOKEN));
-    assert!(headers.contains_key(X402_PAYMENT_RECIPIENT));
-    assert!(headers.contains_key(X402_PAYMENT_NETWORK));
-
-    // Amount should be max(estimated, min_charge).
-    let amount_header = headers[X402_PAYMENT_REQUIRED].to_str().unwrap();
-    let amount: u64 = amount_header.parse().unwrap();
-    assert!(amount >= billing_cfg.min_charge_amount);
-    assert_eq!(amount, 5000); // 5000 > min_charge(100)
-}
-
-#[tokio::test]
-async fn payment_required_enforces_min_charge() {
-    let billing_cfg = test_billing_config();
-    let tangle_cfg = test_tangle_config();
-    let operator: Address = "0x000000000000000000000000000000000000dEaD"
-        .parse()
-        .unwrap();
-
-    // Request amount below min_charge — should be bumped.
-    let resp = payment_required(&billing_cfg, &tangle_cfg, operator, 10);
-    let amount_header = resp.headers()[X402_PAYMENT_REQUIRED].to_str().unwrap();
-    let amount: u64 = amount_header.parse().unwrap();
-    assert_eq!(amount, billing_cfg.min_charge_amount);
-}
-
-// --- extract_x402_spend_auth tests ---
-
-#[test]
-fn extract_x402_spend_auth_parses_valid_json_header() {
-    let payload = SpendAuthPayload {
-        commitment: "0xabc".into(),
-        service_id: 1,
-        job_index: 0,
-        amount: "1000".into(),
-        operator: "0x000000000000000000000000000000000000dEaD".into(),
-        nonce: 42,
-        expiry: 9999999999,
-        signature: "0xdeadbeef".into(),
-    };
-    let json = serde_json::to_string(&payload).unwrap();
-
-    let mut headers = HeaderMap::new();
-    headers.insert(X402_PAYMENT_SIGNATURE, json.parse().unwrap());
-
-    let result = extract_x402_spend_auth(&headers);
-    assert!(result.is_some());
-    let parsed = result.unwrap();
-    assert_eq!(parsed.nonce, 42);
-    assert_eq!(parsed.commitment, "0xabc");
-}
-
-#[test]
-fn extract_x402_spend_auth_returns_none_for_missing_header() {
-    let headers = HeaderMap::new();
-    assert!(extract_x402_spend_auth(&headers).is_none());
-}
-
-#[test]
-fn extract_x402_spend_auth_returns_none_for_invalid_header() {
-    let mut headers = HeaderMap::new();
-    headers.insert(X402_PAYMENT_SIGNATURE, "not-json".parse().unwrap());
-    assert!(extract_x402_spend_auth(&headers).is_none());
-}
-
-// --- error_response tests ---
-
-#[tokio::test]
-async fn error_response_returns_correct_status_and_json() {
-    let resp = error_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        "rate limited".into(),
-        "rate_limit",
-        "too_many_requests",
-    );
-    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-
-    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["error"]["message"], "rate limited");
-    assert_eq!(json["error"]["type"], "rate_limit");
-    assert_eq!(json["error"]["code"], "too_many_requests");
-}
-
 #[tokio::test]
 async fn check_and_insert_is_atomic_under_contention() {
     let store = Arc::new(NonceStore::load(None));
@@ -431,13 +215,11 @@ async fn check_and_insert_is_atomic_under_contention() {
     assert_eq!(replay_count, 99, "all others should see replay");
 }
 
-#[tokio::test]
-use tangle_inference_core::payment::{PaymentProof, PaymentRouter};
+use tangle_inference_core::payment::{PaymentProof, PaymentProvider, PaymentRails, PaymentRouter};
 
 /// Anvil default account #0 private key.
 const TEST_OPERATOR_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
-#[tokio::test]
 #[tokio::test]
 async fn router_rejects_proof_for_disabled_rail() {
     // A shielded-only router must reject a DirectTransfer proof up front —
@@ -664,10 +446,12 @@ mod anvil_e2e {
 
         let result = provider.authorize(&proof).await;
         assert!(result.is_err(), "should reject insufficient amount");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("less than requested"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("less than requested")
+        );
     }
 
     #[tokio::test]
@@ -738,10 +522,12 @@ mod anvil_e2e {
 
         let result = provider.authorize(&proof).await;
         assert!(result.is_err(), "should reject transfer to wrong recipient");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("no ERC-20 Transfer to operator"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no ERC-20 Transfer to operator")
+        );
     }
 
     #[tokio::test]

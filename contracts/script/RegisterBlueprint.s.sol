@@ -78,29 +78,39 @@ abstract contract RegisterBlueprint is Script {
         Types.BlueprintSource memory source;
         source.kind = Types.BlueprintSourceKind.Native;
         string memory fetcher = vm.parseJsonString(json, ".sources[0].native.fetcher");
-        require(keccak256(bytes(fetcher)) == keccak256("Github"), "Github source required");
-        string memory github = ".sources[0].native.github";
-        source.native = Types.NativeSource({
-            fetcher: Types.BlueprintFetcherKind.Github,
-            artifactUri: vm.serializeJsonType(
-                "GithubArtifact(Binary[] binaries,string owner,string repo,string tag)Binary(string arch,string name,string os,string sha256)",
-                vm.parseJsonType(json, github, "GithubArtifact(Binary[] binaries,string owner,string repo,string tag)Binary(string arch,string name,string os,string sha256)")
-            ),
-            entrypoint: vm.parseJsonString(json, ".sources[0].native.entrypoint")
-        });
+        string memory binaryPath;
+        if (keccak256(bytes(fetcher)) == keccak256("None")) {
+            require(block.chainid == 31337, "local binary source requires Anvil");
+            source.native = Types.NativeSource({
+                fetcher: Types.BlueprintFetcherKind.None,
+                artifactUri: vm.parseJsonString(json, ".sources[0].native.artifact_uri"),
+                entrypoint: vm.parseJsonString(json, ".sources[0].native.entrypoint")
+            });
+            binaryPath = ".sources[0].native.binaries[0]";
+        } else {
+            require(keccak256(bytes(fetcher)) == keccak256("Github"), "Github source required");
+            string memory github = ".sources[0].native.github";
+            string memory schema = "GithubArtifact(Binary[] binaries,string owner,string repo,string tag)Binary(string arch,string name,string os,string sha256)";
+            source.native = Types.NativeSource({
+                fetcher: Types.BlueprintFetcherKind.Github,
+                artifactUri: vm.serializeJsonType(schema, vm.parseJsonType(json, github, schema)),
+                entrypoint: vm.parseJsonString(json, ".sources[0].native.entrypoint")
+            });
+            binaryPath = string.concat(github, ".binaries[0]");
+        }
         source.testing = Types.TestingSource({
             cargoPackage: vm.parseJsonString(json, ".sources[0].testing.cargo_package"),
             cargoBin: vm.parseJsonString(json, ".sources[0].testing.cargo_bin"),
             basePath: vm.parseJsonString(json, ".sources[0].testing.base_path")
         });
         source.binaries = new Types.BlueprintBinary[](1);
-        require(keccak256(bytes(vm.parseJsonString(json, string.concat(github, ".binaries[0].arch")))) == keccak256("amd64"), "amd64 binary required");
-        require(keccak256(bytes(vm.parseJsonString(json, string.concat(github, ".binaries[0].os")))) == keccak256("linux"), "linux binary required");
-        string memory hash = vm.parseJsonString(json, string.concat(github, ".binaries[0].sha256"));
+        require(keccak256(bytes(vm.parseJsonString(json, string.concat(binaryPath, ".arch")))) == keccak256("amd64"), "amd64 binary required");
+        require(keccak256(bytes(vm.parseJsonString(json, string.concat(binaryPath, ".os")))) == keccak256("linux"), "linux binary required");
+        string memory hash = vm.parseJsonString(json, string.concat(binaryPath, ".sha256"));
         source.binaries[0] = Types.BlueprintBinary({
             arch: Types.BlueprintArchitecture.Amd64,
             os: Types.BlueprintOperatingSystem.Linux,
-            name: vm.parseJsonString(json, string.concat(github, ".binaries[0].name")),
+            name: vm.parseJsonString(json, string.concat(binaryPath, ".name")),
             sha256: vm.parseBytes32(string.concat("0x", hash))
         });
         def.sources[0] = source;
