@@ -102,3 +102,20 @@ fn throughput_rows_without_run_provenance_are_rejected() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_custom_recipe_cannot_invent_gpu_classes_or_node_capacity() -> anyhow::Result<()> {
+    for (class, tp) in [("H200", 8), ("nvidia-h200", u32::MAX)] {
+        let mut exported: serde_json::Value = serde_json::from_str(ENGINE_PROFILES)?;
+        let classes = &mut exported["families"]["glm-5.3"]["arms"]["native"]["classes"];
+        *classes = serde_json::json!({});
+        classes[class] = serde_json::json!({"tp": [tp]});
+        assert!(
+            RecipeCatalog::from_json(&exported.to_string())
+                .and_then(|catalog| catalog.resolve_for("glm-5.3", None, "native", Some(class), tp))
+                .is_err(),
+            "a recipe cannot override SDK hardware facts: {class}, TP{tp}"
+        );
+    }
+    Ok(())
+}
