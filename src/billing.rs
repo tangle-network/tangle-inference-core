@@ -518,6 +518,56 @@ pub fn recover_spend_auth_signer(
 ) -> Result<Address, String> {
     use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 
+    let (digest, _, _) = spend_auth_hashes(auth, shielded_credits_addr, chain_id)?;
+
+    let sig_hex = auth.signature.strip_prefix("0x").unwrap_or(&auth.signature);
+    let sig_bytes = hex::decode(sig_hex).map_err(|e| format!("invalid signature hex: {e}"))?;
+    if sig_bytes.len() != 65 {
+        return Err(format!(
+            "invalid signature length: expected 65, got {}",
+            sig_bytes.len()
+        ));
+    }
+
+    let v = sig_bytes[64];
+    let recovery_id = match v {
+        27 => 0u8,
+        28 => 1u8,
+        0 | 1 => v,
+        _ => return Err(format!("invalid signature recovery byte: {v}")),
+    };
+
+    let signature =
+        Signature::from_slice(&sig_bytes[..64]).map_err(|e| format!("invalid signature: {e}"))?;
+    let rid = RecoveryId::try_from(recovery_id).map_err(|e| format!("invalid recovery id: {e}"))?;
+    let recovered = VerifyingKey::recover_from_prehash(digest.as_slice(), &signature, rid)
+        .map_err(|e| format!("ecrecover failed: {e}"))?;
+
+    let pubkey_bytes = recovered.to_encoded_point(false);
+    let pubkey_hash = keccak256(&pubkey_bytes.as_bytes()[1..]);
+    let recovered_address = Address::from_slice(&pubkey_hash[12..]);
+
+    // Check expiry with clock skew tolerance
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before UNIX epoch".to_string())?
+        .as_secs();
+    if now > auth.expiry.saturating_add(clock_skew_tolerance_secs) {
+        return Err(format!(
+            "SpendAuth expired: now={now}, expiry={}, tolerance={clock_skew_tolerance_secs}s",
+            auth.expiry
+        ));
+    }
+
+    Ok(recovered_address)
+}
+
+/// EIP-712 hashes shared by verification and the stdin-only signing CLI.
+pub fn spend_auth_hashes(
+    auth: &SpendAuthPayload,
+    shielded_credits_addr: &str,
+    chain_id: u64,
+) -> Result<(B256, B256, B256), String> {
     let shielded_addr: Address = shielded_credits_addr
         .parse()
         .map_err(|e| format!("invalid shielded_credits address: {e}"))?;
@@ -575,44 +625,5 @@ pub fn recover_spend_auth_signer(
         .concat(),
     );
 
-    let sig_hex = auth.signature.strip_prefix("0x").unwrap_or(&auth.signature);
-    let sig_bytes = hex::decode(sig_hex).map_err(|e| format!("invalid signature hex: {e}"))?;
-    if sig_bytes.len() != 65 {
-        return Err(format!(
-            "invalid signature length: expected 65, got {}",
-            sig_bytes.len()
-        ));
-    }
-
-    let v = sig_bytes[64];
-    let recovery_id = match v {
-        27 => 0u8,
-        28 => 1u8,
-        0 | 1 => v,
-        _ => return Err(format!("invalid signature recovery byte: {v}")),
-    };
-
-    let signature =
-        Signature::from_slice(&sig_bytes[..64]).map_err(|e| format!("invalid signature: {e}"))?;
-    let rid = RecoveryId::try_from(recovery_id).map_err(|e| format!("invalid recovery id: {e}"))?;
-    let recovered = VerifyingKey::recover_from_prehash(digest.as_slice(), &signature, rid)
-        .map_err(|e| format!("ecrecover failed: {e}"))?;
-
-    let pubkey_bytes = recovered.to_encoded_point(false);
-    let pubkey_hash = keccak256(&pubkey_bytes.as_bytes()[1..]);
-    let recovered_address = Address::from_slice(&pubkey_hash[12..]);
-
-    // Check expiry with clock skew tolerance
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "system clock is before UNIX epoch".to_string())?
-        .as_secs();
-    if now > auth.expiry.saturating_add(clock_skew_tolerance_secs) {
-        return Err(format!(
-            "SpendAuth expired: now={now}, expiry={}, tolerance={clock_skew_tolerance_secs}s",
-            auth.expiry
-        ));
-    }
-
-    Ok(recovered_address)
+    Ok((digest, domain_separator, struct_hash))
 }

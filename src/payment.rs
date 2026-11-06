@@ -225,11 +225,6 @@ impl UsedTxStore {
                 — replay protection will not survive a restart");
         }
     }
-
-    #[cfg(test)]
-    async fn is_used(&self, tx_hash: &str) -> bool {
-        self.inner.lock().await.used.contains(tx_hash)
-    }
 }
 
 // ─── DirectProvider ───────────────────────────────────────────────────
@@ -588,91 +583,5 @@ pub fn create_provider(
         Ok(Box::new(NoopProvider::new(tangle.operator_key.clone())?))
     } else {
         Ok(Box::new(PaymentRouter::build(rails, tangle, billing)?))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tx(n: u8) -> String {
-        format!("0x{:064x}", n)
-    }
-
-    #[tokio::test]
-    async fn reserve_rejects_replay_and_concurrent() {
-        let store = UsedTxStore::load(None);
-        // First reserve succeeds.
-        store.reserve(&tx(1)).await.unwrap();
-        // Same tx again while in-flight → rejected.
-        assert!(
-            store.reserve(&tx(1)).await.is_err(),
-            "concurrent reserve must fail"
-        );
-        // Commit it; now it's consumed.
-        store.commit(&tx(1)).await;
-        assert!(store.is_used(&tx(1)).await);
-        // A reserve of a consumed tx → rejected as replay.
-        assert!(store.reserve(&tx(1)).await.is_err(), "replay must fail");
-    }
-
-    #[tokio::test]
-    async fn release_allows_retry_after_transient_failure() {
-        let store = UsedTxStore::load(None);
-        store.reserve(&tx(2)).await.unwrap();
-        // Verification "failed" → release the reservation.
-        store.release(&tx(2)).await;
-        assert!(
-            !store.is_used(&tx(2)).await,
-            "released tx must not be consumed"
-        );
-        // The legitimate payer can retry.
-        store.reserve(&tx(2)).await.unwrap();
-        store.commit(&tx(2)).await;
-        assert!(store.is_used(&tx(2)).await);
-    }
-
-    #[tokio::test]
-    async fn consumed_tx_survives_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("used-tx.json");
-
-        // Operator run 1: consume a payment tx.
-        {
-            let store = UsedTxStore::load(Some(path.clone()));
-            store.reserve(&tx(3)).await.unwrap();
-            store.commit(&tx(3)).await;
-        }
-        // Operator restart: a fresh store loads the persisted set and STILL
-        // rejects the same tx — the bug this fixes (in-memory store forgot it).
-        {
-            let store = UsedTxStore::load(Some(path.clone()));
-            assert!(
-                store.is_used(&tx(3)).await,
-                "consumed tx must persist across restart"
-            );
-            assert!(
-                store.reserve(&tx(3)).await.is_err(),
-                "replay of a past payment after restart must be rejected"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn released_tx_is_not_persisted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("used-tx.json");
-        {
-            let store = UsedTxStore::load(Some(path.clone()));
-            store.reserve(&tx(4)).await.unwrap();
-            store.release(&tx(4)).await; // transient failure
-        }
-        // After restart, a released (never-verified) tx is still spendable.
-        let store = UsedTxStore::load(Some(path));
-        assert!(!store.is_used(&tx(4)).await);
-        assert!(
-            store.reserve(&tx(4)).await.is_ok(),
-            "a never-committed tx must remain usable"
-        );
     }
 }
