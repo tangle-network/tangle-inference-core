@@ -3,6 +3,5 @@
   "generation": 2,
   "activePursuit": null,
   "status": "converged",
-  "note": "Gen 2 complete. All 4 harden findings fixed: settlement retry loop, AccountGuard sync Mutex (no Drop race), queue bounds+depth, from validation. 50 tests, 0 failures.",
   "updatedAt": "2026-04-17T00:00:00Z"
 }

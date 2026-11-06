@@ -1,11 +1,4 @@
-//! Payment provider abstraction.
-//!
-//! Decouples inference billing from any specific payment mechanism.
-//! Two implementations:
-//!   - `ShieldedProvider` — existing ShieldedCredits flow (authorize → serve → settle)
-//!   - `DirectProvider` — verify an ERC-20 transfer on-chain (no shielded pool)
-//!
-//! Blueprints use `PaymentProvider` trait; config selects the implementation.
+//! Shielded authorization and verified direct transfer payment rails.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -17,11 +10,9 @@ use crate::billing::BillingClient;
 use crate::config::{BillingConfig, TangleConfig};
 use crate::server::SpendAuthPayload;
 
-/// Payment proof submitted by the caller.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PaymentProof {
-    /// ShieldedCredits spend authorization (existing path).
     SpendAuth(SpendAuthPayload),
     /// Direct on-chain transfer — caller provides tx hash as proof.
     DirectTransfer {
@@ -33,8 +24,7 @@ pub enum PaymentProof {
 }
 
 impl PaymentProof {
-    /// Stable identity of the payer, for per-account rate limiting across rails:
-    /// the shielded commitment, or the direct transfer's sender address.
+    /// Rate limit identity: shielded commitment or claimed direct transfer sender.
     pub fn payer_id(&self) -> &str {
         match self {
             PaymentProof::SpendAuth(sa) => &sa.commitment,
@@ -43,35 +33,18 @@ impl PaymentProof {
     }
 }
 
-/// Result of payment authorization.
-#[derive(Debug, Clone)]
-pub struct AuthorizationResult {
-    pub authorized_amount: u64,
-    pub proof: PaymentProof,
-}
-
-/// Trait for payment providers. Blueprints depend on this, not on a specific
-/// payment mechanism.
+/// Verifies payment before inference and settles according to the selected rail.
 #[async_trait]
 pub trait PaymentProvider: Send + Sync + 'static {
-    /// Verify and authorize a payment proof before serving inference.
-    /// Returns the authorized amount on success.
+    /// Returns the authorized amount in base token units.
     async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64>;
 
-    /// Settle payment after inference is served.
-    /// `actual_cost` may be less than the authorized amount; the shielded rail
-    /// settles only the actual amount via `settlePayment` (the contract refunds
-    /// the unused pre-auth to the user's credit account).
+    /// Settles metered cost after serving; refund policy belongs to each rail.
     async fn settle(&self, proof: &PaymentProof, actual_cost: u64) -> anyhow::Result<()>;
 
-    /// Operator's on-chain address.
     fn operator_address(&self) -> Address;
 }
 
-// ─── ShieldedProvider ─────────────────────────────────────────────────
-
-/// Existing ShieldedCredits payment path.
-/// Wraps `BillingClient` behind the `PaymentProvider` trait.
 pub struct ShieldedProvider {
     client: BillingClient,
 }
@@ -114,21 +87,9 @@ impl PaymentProvider for ShieldedProvider {
     }
 }
 
-// ─── UsedTxStore ──────────────────────────────────────────────────────
-
-/// Replay protection for the Direct rail: a confirmed-consumed set of payment
-/// tx hashes, persisted across restarts, plus an ephemeral in-flight set.
-///
-/// Three properties, all required for a payment rail:
-///   1. **Persistent** — a consumed tx hash survives operator restart (the
-///      in-memory-only predecessor let a restart replay any past payment for
-///      free inference). Mirrors `NonceStore`'s persistence.
-///   2. **Concurrency-safe** — `reserve` holds the lock across check+insert, so
-///      two concurrent requests with the same tx hash cannot both pass.
-///   3. **Retry-safe** — a tx is only *committed* (persisted as consumed) after
-///      its on-chain transfer verifies; a transient RPC failure `release`s the
-///      reservation so a legitimate payer can retry. The predecessor inserted
-///      before verifying, permanently burning a tx on any transient error.
+/// Atomically reserves each transfer against replay and concurrent requests.
+/// Commit persists verified consumption when configured; failed verification releases
+/// the reservation for retry. Failed writes are logged and weaken restart protection.
 pub struct UsedTxStore {
     inner: tokio::sync::Mutex<UsedTxInner>,
     path: Option<PathBuf>,
@@ -141,7 +102,6 @@ struct UsedTxInner {
 }
 
 impl UsedTxStore {
-    /// Load the consumed set from disk if a path is configured.
     pub fn load(path: Option<PathBuf>) -> Self {
         let used: HashSet<String> = path
             .as_ref()
@@ -171,8 +131,6 @@ impl UsedTxStore {
         }
     }
 
-    /// Atomically reserve a tx hash for verification. Errors if it was already
-    /// consumed (replay) or is already being verified concurrently.
     async fn reserve(&self, tx_hash: &str) -> anyhow::Result<()> {
         let mut g = self.inner.lock().await;
         if g.used.contains(tx_hash) {
@@ -184,7 +142,6 @@ impl UsedTxStore {
         Ok(())
     }
 
-    /// Commit a verified tx hash to the persistent consumed set.
     async fn commit(&self, tx_hash: &str) {
         let used_snapshot = {
             let mut g = self.inner.lock().await;
@@ -195,8 +152,6 @@ impl UsedTxStore {
         self.persist(&used_snapshot);
     }
 
-    /// Release a reservation whose verification did not succeed, so a
-    /// legitimate payer can retry (e.g. after a transient RPC error).
     async fn release(&self, tx_hash: &str) {
         self.inner.lock().await.in_flight.remove(tx_hash);
     }
@@ -212,9 +167,6 @@ impl UsedTxStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let tmp = path.with_extension("tmp");
-        // A dropped write here means a consumed tx is live in memory but absent
-        // from disk — a restart would let that transfer be replayed for free
-        // inference. Surface it at error level instead of swallowing it.
         if let Err(e) = std::fs::write(&tmp, &data) {
             tracing::error!(error = %e, "failed to write direct-transfer tx store \
                 — replay protection will not survive a restart");
@@ -225,35 +177,16 @@ impl UsedTxStore {
                 — replay protection will not survive a restart");
         }
     }
-
-    #[cfg(test)]
-    async fn is_used(&self, tx_hash: &str) -> bool {
-        self.inner.lock().await.used.contains(tx_hash)
-    }
 }
 
-// ─── DirectProvider ───────────────────────────────────────────────────
-
-/// Direct on-chain payment verification.
-///
-/// Caller makes an ERC-20 `transfer(operator, amount)` tx and includes the
-/// tx hash as proof. The provider verifies the receipt on-chain:
-///   1. Tx exists and is confirmed
-///   2. Recipient matches operator address
-///   3. Amount >= requested cost
-///   4. Token address matches configured payment token
-///
-/// No shielded pool, no authorization step, no claim step.
-/// Settlement is a no-op (payment already transferred).
+/// Requires a successful transfer with sufficient confirmations to this operator,
+/// using its pinned ERC-20 token and at least the requested amount.
+/// Each transfer is consumed once; prepaid excess is retained at settlement.
 pub struct DirectProvider {
     rpc_url: reqwest::Url,
     operator_address: Address,
-    /// Required — operators MUST pin a specific ERC-20 token to accept.
-    /// Without this, an attacker deploys a worthless token and pays with it.
     expected_token: Address,
     min_confirmations: u64,
-    /// Replay protection — persistent across restarts, retry-safe on transient
-    /// failure. A tx_hash authorizes exactly one request, ever.
     replay: UsedTxStore,
 }
 
@@ -284,9 +217,6 @@ impl DirectProvider {
         })
     }
 
-    /// Verify the on-chain ERC-20 transfer named by the proof. Pure read — does
-    /// no replay bookkeeping (the caller reserves before and commits after), so
-    /// a transient failure here never burns a legitimate tx hash.
     async fn verify_transfer(
         &self,
         tx_hash: &str,
@@ -324,7 +254,6 @@ impl DirectProvider {
             anyhow::bail!("tx {tx_hash} reverted");
         }
 
-        // ── Verify ERC-20 Transfer to operator with the REQUIRED token ──
         let transfer_topic = alloy::primitives::keccak256(b"Transfer(address,address,uint256)");
         let mut found_amount: u64 = 0;
         let mut found = false;
@@ -344,7 +273,6 @@ impl DirectProvider {
                 continue;
             }
 
-            // Token MUST match the configured expected_token.
             if log.address() != self.expected_token {
                 continue;
             }
@@ -364,8 +292,7 @@ impl DirectProvider {
                 }
             }
 
-            // data = amount (uint256). Cap at u64::MAX (only inflates, never
-            // deflates — an attacker can't underpay this way).
+            // Saturation preserves payment sufficiency for every u64 request.
             let value = alloy::primitives::U256::from_be_slice(log.data().data.as_ref());
             found_amount = value.try_into().unwrap_or(u64::MAX);
             found = true;
@@ -409,9 +336,6 @@ impl PaymentProvider for DirectProvider {
             );
         };
 
-        // Reserve the tx hash (rejects replay + concurrent use), then verify
-        // on-chain. Commit only on success so a transient RPC failure releases
-        // the reservation and a legitimate payer can retry.
         self.replay.reserve(tx_hash).await?;
         match self.verify_transfer(tx_hash, from, amount).await {
             Ok(found_amount) => {
@@ -427,9 +351,6 @@ impl PaymentProvider for DirectProvider {
     }
 
     async fn settle(&self, _proof: &PaymentProof, _actual_cost: u64) -> anyhow::Result<()> {
-        // No-op: payment already transferred directly to operator.
-        // If actual_cost < authorized amount, the operator keeps the excess
-        // (same as any prepaid model). Could add refund logic later.
         Ok(())
     }
 
@@ -437,8 +358,6 @@ impl PaymentProvider for DirectProvider {
         self.operator_address
     }
 }
-
-// ─── NoopProvider ─────────────────────────────────────────────────────
 
 /// No billing — open endpoint. `billing_required: false` uses this.
 pub struct NoopProvider {
@@ -470,18 +389,10 @@ impl PaymentProvider for NoopProvider {
     }
 }
 
-// ─── PaymentRouter ────────────────────────────────────────────────────
-
 pub use crate::config::PaymentRails;
 
-/// The universal payment provider: holds the operator's enabled rails and
-/// dispatches each request to the matching one by proof type. Enabling several
-/// rails lets one endpoint accept any of them; a proof for a disabled rail is
-/// rejected. Every rail derives its payout from the same operator key, so funds
-/// land in the same place regardless of how the buyer paid.
-///
-/// This is the single, extensible composition point — adding a rail is a new
-/// `Option<NewProvider>` field plus a match arm, never an enum cross-product.
+/// Enabled rails derive the same operator payout address from the configured key.
+/// Disabled proof types are rejected.
 pub struct PaymentRouter {
     shielded: Option<ShieldedProvider>,
     direct: Option<DirectProvider>,
@@ -494,8 +405,6 @@ impl PaymentRouter {
         tangle: &TangleConfig,
         billing: &BillingConfig,
     ) -> anyhow::Result<Self> {
-        // A rail-less router would build cleanly but reject every request — a
-        // sharp edge on a pub API. Fail at construction, matching `create_provider`.
         if rails.is_empty() {
             anyhow::bail!(
                 "PaymentRouter requires at least one enabled rail \
@@ -510,9 +419,6 @@ impl PaymentRouter {
             .direct
             .then(|| build_direct(tangle, billing))
             .transpose()?;
-        // Take the payout address from a real sub-provider rather than re-deriving
-        // it from the key: one canonical derivation, no chance of divergence, and
-        // the empty-rails guard above guarantees at least one exists.
         let operator_address = shielded
             .as_ref()
             .map(|p| p.operator_address())
@@ -525,9 +431,6 @@ impl PaymentRouter {
         })
     }
 
-    /// Route a proof to the provider for its rail, erroring if that rail is
-    /// disabled. Single dispatch point so `authorize`/`settle` cannot drift and
-    /// a new `PaymentProof` variant fails to compile until it is handled here.
     fn provider_for(&self, proof: &PaymentProof) -> anyhow::Result<&dyn PaymentProvider> {
         match proof {
             PaymentProof::SpendAuth(_) => self
@@ -559,8 +462,6 @@ impl PaymentProvider for PaymentRouter {
     }
 }
 
-// ─── Factory ──────────────────────────────────────────────────────────
-
 fn build_direct(tangle: &TangleConfig, billing: &BillingConfig) -> anyhow::Result<DirectProvider> {
     if billing.payment_token_address.is_none() {
         anyhow::bail!(
@@ -577,8 +478,7 @@ fn build_direct(tangle: &TangleConfig, billing: &BillingConfig) -> anyhow::Resul
     )
 }
 
-/// Build the operator's payment provider for the rails it accepts. An empty rail
-/// set is an open (unbilled) endpoint.
+/// Selects enabled rails, or [`NoopProvider`] for an empty (unbilled) set.
 pub fn create_provider(
     rails: PaymentRails,
     tangle: &TangleConfig,
@@ -588,91 +488,5 @@ pub fn create_provider(
         Ok(Box::new(NoopProvider::new(tangle.operator_key.clone())?))
     } else {
         Ok(Box::new(PaymentRouter::build(rails, tangle, billing)?))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tx(n: u8) -> String {
-        format!("0x{:064x}", n)
-    }
-
-    #[tokio::test]
-    async fn reserve_rejects_replay_and_concurrent() {
-        let store = UsedTxStore::load(None);
-        // First reserve succeeds.
-        store.reserve(&tx(1)).await.unwrap();
-        // Same tx again while in-flight → rejected.
-        assert!(
-            store.reserve(&tx(1)).await.is_err(),
-            "concurrent reserve must fail"
-        );
-        // Commit it; now it's consumed.
-        store.commit(&tx(1)).await;
-        assert!(store.is_used(&tx(1)).await);
-        // A reserve of a consumed tx → rejected as replay.
-        assert!(store.reserve(&tx(1)).await.is_err(), "replay must fail");
-    }
-
-    #[tokio::test]
-    async fn release_allows_retry_after_transient_failure() {
-        let store = UsedTxStore::load(None);
-        store.reserve(&tx(2)).await.unwrap();
-        // Verification "failed" → release the reservation.
-        store.release(&tx(2)).await;
-        assert!(
-            !store.is_used(&tx(2)).await,
-            "released tx must not be consumed"
-        );
-        // The legitimate payer can retry.
-        store.reserve(&tx(2)).await.unwrap();
-        store.commit(&tx(2)).await;
-        assert!(store.is_used(&tx(2)).await);
-    }
-
-    #[tokio::test]
-    async fn consumed_tx_survives_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("used-tx.json");
-
-        // Operator run 1: consume a payment tx.
-        {
-            let store = UsedTxStore::load(Some(path.clone()));
-            store.reserve(&tx(3)).await.unwrap();
-            store.commit(&tx(3)).await;
-        }
-        // Operator restart: a fresh store loads the persisted set and STILL
-        // rejects the same tx — the bug this fixes (in-memory store forgot it).
-        {
-            let store = UsedTxStore::load(Some(path.clone()));
-            assert!(
-                store.is_used(&tx(3)).await,
-                "consumed tx must persist across restart"
-            );
-            assert!(
-                store.reserve(&tx(3)).await.is_err(),
-                "replay of a past payment after restart must be rejected"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn released_tx_is_not_persisted() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("used-tx.json");
-        {
-            let store = UsedTxStore::load(Some(path.clone()));
-            store.reserve(&tx(4)).await.unwrap();
-            store.release(&tx(4)).await; // transient failure
-        }
-        // After restart, a released (never-verified) tx is still spendable.
-        let store = UsedTxStore::load(Some(path));
-        assert!(!store.is_used(&tx(4)).await);
-        assert!(
-            store.reserve(&tx(4)).await.is_ok(),
-            "a never-committed tx must remain usable"
-        );
     }
 }

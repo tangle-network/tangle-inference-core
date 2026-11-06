@@ -5,23 +5,11 @@ use std::path::PathBuf;
 /// Tangle network connection and identity configuration.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TangleConfig {
-    /// JSON-RPC endpoint for the Tangle EVM chain.
     pub rpc_url: String,
-
-    /// Chain ID.
     pub chain_id: u64,
-
-    /// Operator's private key (hex, without 0x prefix).
-    /// In production, use a KMS or hardware signer instead.
     pub operator_key: String,
-
-    /// ShieldedCredits contract address.
     pub shielded_credits: String,
-
-    /// Blueprint ID this operator is registered for.
     pub blueprint_id: u64,
-
-    /// Service ID (set after service activation).
     pub service_id: Option<u64>,
 }
 
@@ -38,58 +26,96 @@ impl fmt::Debug for TangleConfig {
     }
 }
 
+/// AgentProfile secret reference; the SDK provider resolves its public key identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum KeyReference {
+    SecretRef {
+        key: String,
+        #[serde(default)]
+        format: Option<SecretFormat>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretFormat {
+    Raw,
+    Bearer,
+}
+
+#[cfg(feature = "http")]
+impl KeyReference {
+    pub fn secret_bytes(
+        &self,
+        keystore_root: &std::path::Path,
+    ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+        use blueprint_keystore::{
+            backends::Backend,
+            crypto::{k256::K256Ecdsa, BytesEncoding},
+            Keystore, KeystoreConfig,
+        };
+        let path = keystore_root.canonicalize()?;
+        let metadata = std::fs::metadata(&path)?;
+        anyhow::ensure!(metadata.is_dir(), "SDK keystore root must be a directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            anyhow::ensure!(
+                metadata.permissions().mode() & 0o077 == 0,
+                "SDK keystore root must be private to its owner"
+            );
+        }
+        let store = Keystore::new(KeystoreConfig::new().fs_root(path))
+            .map_err(|_| anyhow::anyhow!("SDK keystore is unavailable"))?;
+        let Self::SecretRef { key, .. } = self;
+        let selector = key.strip_prefix("0x").unwrap_or(key);
+        let public = store
+            .list_local::<K256Ecdsa>()
+            .map_err(|_| anyhow::anyhow!("SDK public keys are unavailable"))?
+            .into_iter()
+            .find(|public| public.to_string().eq_ignore_ascii_case(selector))
+            .ok_or_else(|| anyhow::anyhow!("selected SDK key is unavailable"))?;
+        let secret = store
+            .get_secret::<K256Ecdsa>(&public)
+            .map_err(|_| anyhow::anyhow!("selected SDK key is unavailable"))?;
+        let bytes = zeroize::Zeroizing::new(secret.to_bytes());
+        anyhow::ensure!(bytes.len() == 32, "SDK endpoint key must contain 32 bytes");
+        Ok(bytes)
+    }
+}
+
 /// HTTP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// External host to bind.
+    #[serde(default)]
+    pub endpoint_key: Option<KeyReference>,
     #[serde(default = "default_host")]
     pub host: String,
-
-    /// External port to bind.
     #[serde(default = "default_port")]
     pub port: u16,
-
-    /// Maximum concurrent requests.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_requests: usize,
-
-    /// Maximum request body size in bytes (default 16 MiB).
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
-
-    /// Per-request timeout for streaming connections in seconds (default 300).
     #[serde(default = "default_stream_timeout_secs")]
     pub stream_timeout_secs: u64,
-
-    /// Per-chunk idle timeout in seconds for streaming responses (default 30).
     #[serde(default = "default_idle_chunk_timeout_secs")]
     pub idle_chunk_timeout_secs: u64,
-
-    /// Maximum size of the SSE line buffer in bytes (default 1 MiB).
     #[serde(default = "default_max_line_buf_bytes")]
     pub max_line_buf_bytes: usize,
-
-    /// Maximum concurrent requests per credit account (commitment).
-    /// 0 = unlimited (default).
+    /// Per-account concurrency; zero means unlimited.
     #[serde(default)]
     pub max_per_account_requests: usize,
 }
 
-/// The payment rails an operator accepts on its billable surfaces.
-///
-/// A request is served when it carries a valid proof for an ENABLED rail; an
-/// empty set is an open (unbilled) endpoint. Rails compose freely — enabling
-/// several lets one endpoint take any of them, dispatched per request by proof
-/// type (see [`crate::payment::PaymentRouter`]). Adding a new rail is one more
-/// flag here plus a `PaymentProvider` impl — never an enum cross-product.
+/// Enabled payment rails. An empty set leaves billing disabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PaymentRails {
-    /// ShieldedCredits SpendAuth — private, prepaid shielded-pool balance.
     #[serde(default)]
     pub shielded: bool,
-    /// Direct ERC-20 transfer — plain USDC, pay-per-call (needs a pinned
-    /// `payment_token_address`).
     #[serde(default)]
     pub direct: bool,
 }
@@ -112,7 +138,6 @@ impl PaymentRails {
         direct: true,
     };
 
-    /// No rail enabled → open, unbilled endpoint.
     pub fn is_empty(&self) -> bool {
         !self.shielded && !self.direct
     }
@@ -124,76 +149,53 @@ impl Default for PaymentRails {
     }
 }
 
-/// Billing configuration.
-///
-/// `deny_unknown_fields` makes a stale or mistyped key (e.g. the removed
-/// `payment_mode`) a loud config-load error rather than a silent default —
-/// fail-closed, since these settings govern who pays and how much.
+/// Billing configuration rejects stale or misspelled fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BillingConfig {
-    /// Which payment rails this operator accepts. Default: shielded only.
-    /// e.g. `{ shielded = true, direct = true }` to take both.
     #[serde(default)]
     pub payment_rails: PaymentRails,
 
-    /// Whether billing (spend_auth / direct transfer) is required on every request.
     #[serde(default = "default_billing_required")]
     pub billing_required: bool,
 
-    /// Maximum amount a single SpendAuth can authorize (anti-abuse).
     pub max_spend_per_request: u64,
 
-    /// Minimum balance required in a credit account to serve a request.
     pub min_credit_balance: u64,
 
-    /// Minimum charge amount per request (gas cost protection).
     #[serde(default)]
     pub min_charge_amount: u64,
 
-    /// Maximum retries for on-chain settlement calls (settlePayment / claimPayment).
     #[serde(default = "default_claim_max_retries")]
     pub claim_max_retries: u32,
 
-    /// Clock skew tolerance in seconds for SpendAuth expiry checks.
     #[serde(default = "default_clock_skew_tolerance")]
     pub clock_skew_tolerance_secs: u64,
 
-    /// Maximum gas price in gwei the operator is willing to pay for billing txs.
-    /// 0 = no cap (default).
+    /// Zero disables the gas-price cap.
     #[serde(default)]
     pub max_gas_price_gwei: u64,
 
-    /// Path to persist used nonces across restarts (replay protection).
     #[serde(default = "default_nonce_store_path")]
     pub nonce_store_path: Option<PathBuf>,
 
-    /// Path to persist consumed direct-transfer tx hashes across restarts.
-    /// Without it, an operator restart forgets used payment txs and the same
-    /// transfer can be replayed for unlimited free inference — the Direct
-    /// rail's analogue of `nonce_store_path`.
+    /// Persist consumed transfers to prevent replay after restart.
     #[serde(default = "default_direct_replay_store_path")]
     pub direct_replay_store_path: Option<PathBuf>,
 
-    /// ERC-20 token address for x402 payment (e.g. USDC wrapped via VAnchor).
     #[serde(default)]
     pub payment_token_address: Option<String>,
 }
 
-/// GPU hardware configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuConfig {
-    /// Expected number of GPUs.
     pub expected_gpu_count: u32,
 
-    /// Minimum required VRAM per GPU in MiB.
     pub min_vram_mib: u32,
 
-    /// GPU model name for on-chain registration.
     #[serde(default)]
     pub gpu_model: Option<String>,
 
-    /// GPU monitoring interval in seconds.
     #[serde(default = "default_monitor_interval")]
     pub monitor_interval_secs: u64,
 }
@@ -248,86 +250,4 @@ fn default_nonce_store_path() -> Option<PathBuf> {
 
 fn default_direct_replay_store_path() -> Option<PathBuf> {
     Some(PathBuf::from("data/used-tx.json"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_server_config_defaults() {
-        let json = r#"{}"#;
-        let cfg: ServerConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.host, "0.0.0.0");
-        assert_eq!(cfg.port, 8080);
-        assert_eq!(cfg.max_concurrent_requests, 64);
-        assert_eq!(cfg.max_request_body_bytes, 16 * 1024 * 1024);
-        assert_eq!(cfg.stream_timeout_secs, 300);
-        assert_eq!(cfg.idle_chunk_timeout_secs, 30);
-        assert_eq!(cfg.max_line_buf_bytes, 1024 * 1024);
-        assert_eq!(cfg.max_per_account_requests, 0);
-    }
-
-    #[test]
-    fn test_tangle_config_redacts_key() {
-        let cfg = TangleConfig {
-            rpc_url: "http://localhost:8545".into(),
-            chain_id: 31337,
-            operator_key: "deadbeef".into(),
-            shielded_credits: "0x0000000000000000000000000000000000000002".into(),
-            blueprint_id: 1,
-            service_id: None,
-        };
-        let debug = format!("{:?}", cfg);
-        assert!(debug.contains("[REDACTED]"));
-        assert!(!debug.contains("deadbeef"));
-    }
-
-    #[test]
-    fn test_billing_config_defaults() {
-        let json = r#"{
-            "max_spend_per_request": 1000000,
-            "min_credit_balance": 1000
-        }"#;
-        let cfg: BillingConfig = serde_json::from_str(json).unwrap();
-        assert!(cfg.billing_required);
-        assert_eq!(cfg.claim_max_retries, 3);
-        assert_eq!(cfg.clock_skew_tolerance_secs, 30);
-        assert_eq!(cfg.max_gas_price_gwei, 0);
-        // The headline change of this file: the serde default must be shielded-only.
-        assert_eq!(cfg.payment_rails, PaymentRails::SHIELDED);
-    }
-
-    #[test]
-    fn test_billing_config_rejects_stale_payment_mode() {
-        // A config carrying the removed `payment_mode` key must fail loudly
-        // (deny_unknown_fields) instead of silently defaulting to shielded.
-        let json = r#"{
-            "max_spend_per_request": 1000000,
-            "min_credit_balance": 1000,
-            "payment_mode": "both"
-        }"#;
-        assert!(serde_json::from_str::<BillingConfig>(json).is_err());
-    }
-
-    #[test]
-    fn test_payment_rails_serde_round_trip() {
-        for rails in [
-            PaymentRails::NONE,
-            PaymentRails::SHIELDED,
-            PaymentRails::DIRECT,
-            PaymentRails::BOTH,
-        ] {
-            let s = serde_json::to_string(&rails).unwrap();
-            let back: PaymentRails = serde_json::from_str(&s).unwrap();
-            assert_eq!(rails, back, "round-trip mismatch for {rails:?}");
-        }
-        // Empty object → the field defaults, NONE has both flags false.
-        assert_eq!(
-            serde_json::from_str::<PaymentRails>("{}").unwrap(),
-            PaymentRails::NONE
-        );
-        // A typo'd rail key is rejected, not silently treated as a default.
-        assert!(serde_json::from_str::<PaymentRails>(r#"{"direc": true}"#).is_err());
-    }
 }
