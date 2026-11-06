@@ -68,7 +68,7 @@ async fn runtime_identity_follows_own_running_inodes() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let running = directory.path().join("runtime-probe");
     std::fs::copy(&executable, &running)?;
-    let argv = vec![
+    let argv = [
         running.to_str().unwrap().to_owned(),
         "--exact".into(),
         "runtime_identity_follows_own_running_inodes".into(),
