@@ -1,7 +1,9 @@
 use alloy::primitives::Address;
 use axum::{
     body::Body,
+    extract::{Request, State},
     http::{header, HeaderMap, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
@@ -9,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::billing::BillingClient;
 use crate::config::{BillingConfig, TangleConfig};
-use crate::payment::{PaymentProof, PaymentProvider};
+use crate::payment::PaymentProof;
 use crate::settlement_queue::{FailedSettlement, SettlementRecoveryQueue};
 
 // x402 header constants
@@ -80,6 +82,38 @@ pub struct ErrorDetail {
     pub message: String,
     pub r#type: String,
     pub code: String,
+}
+
+/// Require the configured private endpoint credential before any handler runs.
+pub async fn authenticate_endpoint(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.endpoint_authorization else {
+        return next.run(request).await;
+    };
+    use sha2::{Digest, Sha256};
+    let mut headers = request.headers().get_all(header::AUTHORIZATION).iter();
+    let digest = Sha256::digest(headers.next().map_or(&[][..], |header| header.as_bytes()));
+    let mismatch = expected
+        .iter()
+        .zip(digest)
+        .fold(0u8, |diff, (left, right)| diff | (*left ^ right));
+    if mismatch != 0 || headers.next().is_some() {
+        let mut response = error_response(
+            StatusCode::UNAUTHORIZED,
+            "Invalid API key.".into(),
+            "authentication_error",
+            "invalid_api_key",
+        );
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Bearer"),
+        );
+        return response;
+    }
+    next.run(request).await
 }
 
 /// Build a standard JSON error response.
@@ -372,66 +406,6 @@ pub fn acquire_permit(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePer
             "too_many_requests",
         )
     })
-}
-
-/// Generic payment gate — works with any PaymentProvider.
-///
-/// Extracts payment proof from the request body (either `spend_auth` for
-/// ShieldedCredits or `payment` for DirectTransfer), validates via the
-/// provider's `authorize()`, returns the proof + authorized amount.
-///
-/// New blueprints should use this instead of `billing_gate`.
-#[allow(clippy::result_large_err)]
-pub async fn payment_gate(
-    provider: &dyn PaymentProvider,
-    billing_config: &BillingConfig,
-    headers: &HeaderMap,
-    body_spend_auth: Option<SpendAuthPayload>,
-    body_payment: Option<PaymentProof>,
-    estimated_cost: u64,
-) -> Result<(Option<PaymentProof>, Option<u64>), Response> {
-    // Try to extract payment proof from multiple sources
-    let proof = if let Some(p) = body_payment {
-        Some(p)
-    } else if let Some(sa) = body_spend_auth {
-        Some(PaymentProof::SpendAuth(sa))
-    } else {
-        extract_x402_spend_auth(headers).map(PaymentProof::SpendAuth)
-    };
-
-    if billing_config.billing_required && proof.is_none() {
-        return Err(error_response(
-            StatusCode::PAYMENT_REQUIRED,
-            format!("payment required — estimated cost: {estimated_cost}"),
-            "billing_error",
-            "payment_required",
-        ));
-    }
-
-    let Some(proof) = proof else {
-        return Ok((None, None));
-    };
-
-    match provider.authorize(&proof).await {
-        Ok(amount) => Ok((Some(proof), Some(amount))),
-        Err(e) => Err(error_response(
-            StatusCode::PAYMENT_REQUIRED,
-            format!("payment authorization failed: {e}"),
-            "billing_error",
-            "authorization_failed",
-        )),
-    }
-}
-
-/// Settle payment after inference. Works with any PaymentProvider.
-///
-/// New blueprints should use this instead of `settle_billing`.
-pub async fn settle_payment(
-    provider: &dyn PaymentProvider,
-    proof: &PaymentProof,
-    actual_cost: u64,
-) -> Result<(), anyhow::Error> {
-    provider.settle(proof, actual_cost).await
 }
 
 /// Full billing gate: extract SpendAuth from body or x402 header, enforce

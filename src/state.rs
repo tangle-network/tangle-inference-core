@@ -53,26 +53,7 @@ impl NonceStore {
         }
     }
 
-    /// Check if the nonce is already used. Does NOT insert — use
-    /// `check_and_insert` for the atomic check+insert pattern.
-    pub async fn check_replay(&self, key: &NonceKey, tolerance: u64) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut nonces = self.nonces.write().await;
-        nonces.retain(|_, expiry| now <= expiry.saturating_add(tolerance));
-        nonces.contains_key(key)
-    }
-
-    /// Atomically check if a nonce is already used AND insert it if not.
-    /// Returns `true` if the nonce was already present (replay detected).
-    /// Returns `false` if the nonce was fresh and has been recorded.
-    ///
-    /// This is the primary API for replay protection — it holds the write
-    /// lock across both the check and the insert, preventing TOCTOU races
-    /// where two concurrent requests with the same nonce could both pass
-    /// a separate check_replay before either inserts.
+    /// Atomically record a nonce; return true if it was already consumed.
     pub async fn check_and_insert(&self, key: NonceKey, expiry: u64, tolerance: u64) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -86,19 +67,6 @@ impl NonceStore {
         nonces.insert(key, expiry);
         self.persist(&nonces);
         false // fresh
-    }
-
-    /// Record a nonce as used, evict expired entries, and persist to disk.
-    /// Prefer `check_and_insert` for the atomic check+insert pattern.
-    pub async fn insert(&self, key: NonceKey, expiry: u64, tolerance: u64) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut nonces = self.nonces.write().await;
-        nonces.retain(|_, exp| now <= exp.saturating_add(tolerance));
-        nonces.insert(key, expiry);
-        self.persist(&nonces);
     }
 
     fn persist(&self, nonces: &HashMap<NonceKey, u64>) {
@@ -158,11 +126,6 @@ impl AccountGuard {
         drop(map);
         Some(Self { commitment, active })
     }
-
-    /// Create a guard without checking capacity (for backwards compat).
-    pub fn new(commitment: String, active: Arc<std::sync::Mutex<HashMap<String, usize>>>) -> Self {
-        Self { commitment, active }
-    }
 }
 
 impl Drop for AccountGuard {
@@ -198,6 +161,7 @@ pub struct AppState {
     /// Supports ShieldedCredits, DirectTransfer, or NoOp depending on config.
     /// New blueprints should use this instead of `billing` directly.
     pub payment_provider: Arc<dyn PaymentProvider>,
+    pub(crate) endpoint_authorization: Option<[u8; 32]>,
 }
 
 impl AppState {
@@ -347,6 +311,44 @@ impl AppStateBuilder {
             )?),
         };
 
+        let endpoint_authorization = if let Some(reference) = &server_config.endpoint_key {
+            use crate::config::{KeyReference, SecretFormat};
+            use sha2::{Digest, Sha256};
+            use std::fmt::Write;
+            anyhow::ensure!(
+                matches!(
+                    reference,
+                    KeyReference::SecretRef {
+                        format: Some(SecretFormat::Bearer),
+                        ..
+                    }
+                ),
+                "endpoint key requires bearer format"
+            );
+            let root = std::env::var_os("KEYSTORE_URI")
+                .ok_or_else(|| anyhow::anyhow!("endpoint key requires KEYSTORE_URI"))?;
+            let secret = reference.secret_bytes(std::path::Path::new(&root))?;
+            let signer = k256::ecdsa::SigningKey::from_slice(&secret)?;
+            let public = signer.verifying_key().to_encoded_point(false);
+            let hash = alloy::primitives::keccak256(&public.as_bytes()[1..]);
+            anyhow::ensure!(
+                Address::from_slice(&hash[12..]) != operator_address,
+                "endpoint key must be separate from the chain wallet"
+            );
+            let mut token = zeroize::Zeroizing::new(String::with_capacity(64));
+            for byte in secret.iter() {
+                write!(&mut *token, "{byte:02x}")?;
+            }
+            Some(
+                Sha256::new()
+                    .chain_update(b"Bearer ")
+                    .chain_update(token.as_bytes())
+                    .finalize()
+                    .into(),
+            )
+        } else {
+            None
+        };
         Ok(AppState {
             billing,
             nonce_store,
@@ -359,6 +361,7 @@ impl AppStateBuilder {
             settlement_recovery_queue: self.settlement_recovery_queue,
             payment_provider,
             backend,
+            endpoint_authorization,
         })
     }
 }

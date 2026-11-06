@@ -87,7 +87,10 @@ impl KeyReference {
 
 /// HTTP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    #[serde(default)]
+    pub endpoint_key: Option<KeyReference>,
     #[serde(default = "default_host")]
     pub host: String,
     #[serde(default = "default_port")]
