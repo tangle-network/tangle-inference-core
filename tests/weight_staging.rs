@@ -159,6 +159,38 @@ async fn reject(
     let _ = result.expect_err("staging unexpectedly succeeded");
 }
 
+async fn engine_config(
+    origin: &Origin,
+    source: &WeightSource,
+    cache: &std::path::Path,
+    child: &std::path::Path,
+) -> (EngineConfig, std::path::PathBuf) {
+    let script = child.join("engine.py");
+    let marker = child.join("started.json");
+    std::fs::write(&script, r#"import argparse,http.server,json,os,pathlib
+p=argparse.ArgumentParser();p.add_argument('marker')
+for flag in ['model','model-path','served-model-name','host','port']: p.add_argument('--'+flag)
+a,_=p.parse_known_args();model=a.model_path or a.model
+pathlib.Path(a.marker).write_text(json.dumps({'pid':os.getpid(),'model':model,'served':a.served_model_name}))
+assert next(pathlib.Path(model).rglob('weights.bin')).read_bytes()==b'hello'
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200 if self.path=='/health' else 404);self.end_headers()
+    def log_message(self,*args):pass
+http.server.HTTPServer.allow_reuse_address=True
+http.server.HTTPServer((a.host,int(a.port)),H).serve_forever()
+"#).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let config = serde_json::from_value(serde_json::json!({
+        "model":"acme/derived", "host":"127.0.0.1", "command":format!("python3 {} {}",script.display(),marker.display()),
+        "port":port, "startup_timeout_secs":5,
+        "weights":{"manifest_url":format!("{}/manifest",origin.url),"manifestSha":source.manifest_sha,
+            "sizeBytes":source.size_bytes,"cache_dir":cache,"allow_loopback_http":true}
+    })).unwrap();
+    (config, marker)
+}
+
 #[tokio::test]
 async fn whole_manifest_is_checked_before_any_shard_fetch() {
     let origin = Origin::start().await;
@@ -257,22 +289,7 @@ async fn invalid_shards_prevent_staging_and_engine_child_start() {
     let source = origin.manifest(serde_json::json!([origin.file("weights.bin")]), 5);
     let destination = tempfile::tempdir().unwrap();
     let child = tempfile::tempdir().unwrap();
-    let script = child.path().join("engine.py");
-    let marker = child.path().join("spawned");
-    std::fs::write(
-        &script,
-        "import pathlib,sys\npathlib.Path(sys.argv[1]).write_text('spawned')\n",
-    )
-    .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let config: EngineConfig = serde_json::from_value(serde_json::json!({
-        "model":"acme/derived", "command":format!("python3 {} {}",script.display(),marker.display()),
-        "port":port, "startup_timeout_secs":1,
-        "weights":{"manifest_url":format!("{}/manifest",origin.url),"manifestSha":source.manifest_sha,
-            "sizeBytes":source.size_bytes,"cache_dir":destination.path(),"allow_loopback_http":true}
-    })).unwrap();
+    let (config, marker) = engine_config(&origin, &source, destination.path(), child.path()).await;
     for wire in [
         b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO".to_vec(),
         b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhe".to_vec(),
@@ -298,22 +315,57 @@ async fn invalid_shards_prevent_staging_and_engine_child_start() {
 }
 
 #[tokio::test]
-async fn cache_changes_are_refused_offline_without_repairing_or_deleting_data() {
+async fn verified_cache_reaches_child_and_restart_refuses_offline_tampering() {
     let origin = Origin::start().await;
     let source = origin.manifest(serde_json::json!([origin.file("nested/weights.bin")]), 5);
     origin.serve("/weights", b"hello".to_vec());
     let destination = tempfile::tempdir().unwrap();
+    let child = tempfile::tempdir().unwrap();
+    let (config, marker) = engine_config(&origin, &source, destination.path(), child.path()).await;
+    let process = EngineProcess::spawn(config).await.unwrap();
+    assert!(!process.is_healthy().await && !marker.exists());
+    assert!(
+        origin.take_requests().is_empty(),
+        "spawn blocked on downloading"
+    );
+    process.wait_ready().await.unwrap();
+    let launched: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(launched["served"], "acme/derived");
+    assert_eq!(
+        launched["model"],
+        destination
+            .path()
+            .join(&source.manifest_sha)
+            .to_str()
+            .unwrap()
+    );
+    assert_eq!(
+        process
+            .client()
+            .get(format!("{}/health", process.endpoint()))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(origin.take_requests(), ["/manifest", "/weights"]);
     let url = format!("{}/manifest", origin.url);
+    drop(origin);
     let verified = stage_weights(&url, &source, destination.path(), &fixture_limits())
         .await
         .unwrap();
-    drop(origin);
-    let cached = stage_weights(&url, &source, destination.path(), &fixture_limits())
-        .await
-        .unwrap();
-    assert_eq!(cached.model_dir(), verified.model_dir());
+    process.restart().await.unwrap();
+    let restarted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+    assert!(launched["pid"].as_u64().unwrap() > 0 && restarted["pid"] != launched["pid"]);
+    assert_eq!(restarted["model"], launched["model"]);
     let file = verified.model_dir().join("nested/weights.bin");
     std::fs::write(&file, b"HELLO").unwrap();
+    std::fs::remove_file(&marker).unwrap();
+    assert!(process.restart().await.is_err());
+    assert!(!marker.exists() && !process.is_healthy().await);
     reject(&url, &source, destination.path(), &fixture_limits()).await;
     assert_eq!(std::fs::read(&file).unwrap(), b"HELLO");
     std::fs::write(&file, b"hello").unwrap();
@@ -354,7 +406,7 @@ async fn cache_and_destination_symlinks_are_never_followed() {
 }
 
 #[tokio::test]
-async fn cancellation_cleans_only_its_private_partial_directory() {
+async fn shutdown_during_staging_never_launches_child_or_removes_unrelated_cache() {
     let origin = Origin::start().await;
     let source = origin.manifest(serde_json::json!([origin.file("weights.bin")]), 5);
     origin.reply(
@@ -367,15 +419,21 @@ async fn cancellation_cleans_only_its_private_partial_directory() {
     let keep = destination.path().join("keep");
     std::fs::create_dir(&keep).unwrap();
     std::fs::write(keep.join("data"), b"owned elsewhere").unwrap();
-    let target = destination.path().to_owned();
-    let url = format!("{}/manifest", origin.url);
-    let staging =
-        tokio::spawn(async move { stage_weights(&url, &source, &target, &fixture_limits()).await });
+    let child = tempfile::tempdir().unwrap();
+    let (config, marker) = engine_config(&origin, &source, destination.path(), child.path()).await;
+    let process = Arc::new(EngineProcess::spawn(config).await.unwrap());
+    let waiting = process.clone();
+    let staging = tokio::spawn(async move { waiting.wait_ready().await });
     tokio::time::timeout(Duration::from_secs(5), origin.wait_for_request("/weights"))
         .await
         .unwrap();
-    staging.abort();
-    assert!(staging.await.unwrap_err().is_cancelled());
+    process.shutdown().await;
+    assert!(tokio::time::timeout(Duration::from_secs(5), staging)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert!(!marker.exists() && !process.is_healthy().await);
     assert_eq!(
         std::fs::read(keep.join("data")).unwrap(),
         b"owned elsewhere"

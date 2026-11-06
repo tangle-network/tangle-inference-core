@@ -78,12 +78,15 @@ async fn direct_transfer_authorization_and_rejections_on_anvil() -> anyhow::Resu
     let caller: PrivateKeySigner = CALLER_KEY.parse()?;
     let sender = caller.address();
     token
-        .mint(sender, U256::from(1_000_000))
+        .mint(sender, U256::from(1_000_000u64))
         .send()
         .await?
         .get_receipt()
         .await?;
-    assert_eq!(token.balanceOf(sender).call().await?, U256::from(1_000_000));
+    assert_eq!(
+        token.balanceOf(sender).call().await?,
+        U256::from(1_000_000u64)
+    );
     let payer = ProviderBuilder::new()
         .wallet(EthereumWallet::from(caller))
         .connect_http(rpc.parse()?);
@@ -96,7 +99,7 @@ async fn direct_transfer_authorization_and_rejections_on_anvil() -> anyhow::Resu
         None,
     )?;
     for (destination, sent, claimed, expected_error) in [
-        (recipient, 500_000, 500_000, None),
+        (recipient, 500_000u64, 500_000u64, None),
         (recipient, 100, 500, Some("less than requested")),
         (
             "0x000000000000000000000000000000000000dEaD".parse::<Address>()?,
