@@ -42,10 +42,6 @@ tempfile = "3"
 futures = "0.3"
 
 [[example]]
-name = "minimal_operator"
-path = "examples/minimal_operator.rs"
-
-[[example]]
 name = "sign_spend_auth"
 path = "examples/sign_spend_auth.rs"
 required-features = ["billing", "http"]

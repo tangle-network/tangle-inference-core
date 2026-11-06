@@ -11,6 +11,8 @@ Blueprints retain their HTTP adapters, model rules, pricing and chain job schema
   existing backend. Never relabel a derivative as an unrelated family.
 - Expand `run_operator!` with the adapter's registration payload, router and
   background service. Reuse `qos::{QoSConfig, start_heartbeat}`.
+- Inherit `contracts/InferenceBSMBase.sol` and bind the trusted registry in the
+  constructor or atomic proxy initializer before registration.
 - Inherit `contracts/script/RegisterBlueprint.s.sol` in a small manager-deployment
   adapter. The shared builder reads `deploy/definition.json`, including
   `metadata.profiling_data`; the manager address comes from deployment.
