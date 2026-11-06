@@ -12,28 +12,21 @@ use alloy::{
 use crate::config::{BillingConfig, TangleConfig};
 use crate::server::SpendAuthPayload;
 
-/// Trait for computing request cost. Blueprints implement this to define
-/// their own pricing model (per-token, per-second, flat rate, etc.).
+/// Blueprint pricing in base token units.
 pub trait CostModel: Send + Sync + 'static {
-    /// Calculate cost in base token units for the given request parameters.
-    /// Returns the cost that should be charged.
     fn calculate_cost(&self, params: &CostParams) -> u64;
 }
 
-/// Parameters passed to `CostModel::calculate_cost`.
 #[derive(Debug, Clone, Default)]
 pub struct CostParams {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
-    /// Optional task type for task-aware pricing models
-    /// (e.g. "chat", "tts", "stt", "image", "video", "embedding").
+    /// Backend task type for pricing by task.
     pub task_type: Option<String>,
-    /// Arbitrary key-value pairs for backend-specific cost inputs
-    /// (e.g. GPU-seconds, image dimensions, characters, centiseconds).
+    /// Backend quantities keyed by the cost models below.
     pub extra: std::collections::HashMap<String, u64>,
 }
 
-/// Per-token pricing — classic LLM inference model.
 pub struct PerTokenCostModel {
     pub price_per_input_token: u64,
     pub price_per_output_token: u64,
@@ -49,8 +42,7 @@ impl CostModel for PerTokenCostModel {
     }
 }
 
-/// Per-1K-character pricing — TTS blueprints.
-/// Reads `extra["characters"]`.
+/// Per-thousand-character pricing from `extra["characters"]`.
 pub struct PerCharCostModel {
     pub price_per_1k_chars: u64,
 }
@@ -62,9 +54,7 @@ impl CostModel for PerCharCostModel {
     }
 }
 
-/// Per-second pricing — audio transcription, video generation.
-/// Reads `extra["centiseconds"]` (1 second = 100 centiseconds) for sub-second
-/// granularity without floats.
+/// Per-second pricing from `extra["centiseconds"]`, in hundredths of a second.
 pub struct PerSecondCostModel {
     pub price_per_second: u64,
 }
@@ -76,8 +66,7 @@ impl CostModel for PerSecondCostModel {
     }
 }
 
-/// Per-image pricing — image generation.
-/// Reads `extra["images"]`, defaults to 1.
+/// Per-image pricing from `extra["images"]`, defaulting to one image.
 pub struct PerImageCostModel {
     pub price_per_image: u64,
 }
@@ -89,7 +78,6 @@ impl CostModel for PerImageCostModel {
     }
 }
 
-/// Flat per-request pricing.
 pub struct FlatRequestCostModel {
     pub price_per_request: u64,
 }
@@ -100,8 +88,7 @@ impl CostModel for FlatRequestCostModel {
     }
 }
 
-/// Task-type-aware pricing — dispatches to a sub-model based on `task_type`.
-/// Used by Modal which serves multiple task types under one operator.
+/// Dispatches known task types to their model, otherwise using the default.
 pub struct TaskTypeCostModel {
     pub default: Box<dyn CostModel>,
     pub per_task: std::collections::HashMap<String, Box<dyn CostModel>>,
@@ -118,7 +105,6 @@ impl CostModel for TaskTypeCostModel {
     }
 }
 
-// Generate bindings for the ShieldedCredits contract.
 sol! {
     #[sol(rpc)]
     interface IShieldedCredits {
@@ -153,7 +139,6 @@ pub struct AccountInfo {
     pub balance: U256,
 }
 
-/// Handles ShieldedCredits billing operations.
 pub struct BillingClient {
     claim_max_retries: u32,
     max_gas_price_gwei: u64,
@@ -195,12 +180,10 @@ impl BillingClient {
         })
     }
 
-    /// Returns the configured service_id this client claims payments for.
     pub fn service_id(&self) -> u64 {
         self.service_id
     }
 
-    /// Returns the operator's Ethereum address.
     pub fn operator_address(&self) -> Address {
         self.operator_address
     }
@@ -245,7 +228,6 @@ impl BillingClient {
         Ok(FixedBytes(hash.0))
     }
 
-    /// Check current gas price against the configured cap.
     async fn check_gas_price(&self) -> anyhow::Result<()> {
         let max_gwei = self.max_gas_price_gwei;
         if max_gwei == 0 {
@@ -287,16 +269,8 @@ impl BillingClient {
         Ok(())
     }
 
-    /// Claim payment on-chain after inference is served.
-    ///
-    /// The ShieldedCredits contract `claimPayment(bytes32, address)` settles the
-    /// full pre-authorized amount. This is the fallback for requests where usage
-    /// metering is unavailable (e.g. a streaming backend that ended without a
-    /// usage chunk) — prefer [`Self::settle_payment`] when the actual metered
-    /// cost is known so the unused pre-auth is refunded to the user.
-    /// `actual_amount` is logged for auditing only.
-    ///
-    /// Retries up to `claim_max_retries` times with exponential backoff.
+    /// Claims the full preauthorization when usage is unavailable.
+    /// `actual_amount` is audit-only; metered callers use [`Self::settle_payment`].
     pub async fn claim_payment(
         &self,
         spend_auth: &SpendAuthPayload,
@@ -305,17 +279,8 @@ impl BillingClient {
         self.settle_on_chain(spend_auth, None, actual_amount).await
     }
 
-    /// Settle payment on-chain after inference is served, charging only the
-    /// actual metered amount.
-    ///
-    /// Calls the ShieldedCredits `settlePayment(authHash, recipient, amount)`:
-    /// the recipient receives exactly `actual_amount` and the contract refunds
-    /// the unused pre-auth (`pre-auth − actual_amount`) to the credit account in
-    /// the same transaction. Requires a ShieldedCredits deployment that exposes
-    /// `settlePayment` (deployed and proven on Base Sepolia); `actual_amount`
-    /// must not exceed the pre-authorized amount or the call reverts.
-    ///
-    /// Retries up to `claim_max_retries` times with exponential backoff.
+    /// Charges metered use and atomically refunds unused preauthorization.
+    /// `actual_amount` must not exceed the preauthorized amount or the contract reverts.
     pub async fn settle_payment(
         &self,
         spend_auth: &SpendAuthPayload,
@@ -325,10 +290,8 @@ impl BillingClient {
             .await
     }
 
-    /// Shared settlement path for [`Self::claim_payment`] and
-    /// [`Self::settle_payment`]. `metered_amount = Some(_)` sends the metered
-    /// `settlePayment`; `None` sends the full-pre-auth `claimPayment`.
-    /// `audit_amount` is the operator-computed cost, logged for auditing.
+    /// `Some(amount)` settles metered use; `None` claims the full preauthorization.
+    /// Retries use `claim_max_retries` with exponential backoff; `audit_amount` affects logs only.
     async fn settle_on_chain(
         &self,
         spend_auth: &SpendAuthPayload,
@@ -352,7 +315,6 @@ impl BillingClient {
 
         let mut last_err = None;
         for attempt in 0..=max_retries {
-            // Backoff before retries (not before the first attempt).
             if attempt > 0 {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));
                 tracing::warn!(
@@ -363,8 +325,6 @@ impl BillingClient {
                 tokio::time::sleep(delay).await;
             }
 
-            // Check gas price — if too high, skip this attempt (loop will
-            // backoff on the next iteration via the block above).
             if let Err(e) = self.check_gas_price().await {
                 tracing::warn!(error = %e, attempt, "gas price check failed for {op_label}");
                 last_err = Some(e);
@@ -420,7 +380,6 @@ impl BillingClient {
         Err(err)
     }
 
-    /// Query on-chain account info (spending key + balance).
     pub async fn get_account_info(&self, commitment: &str) -> anyhow::Result<AccountInfo> {
         let commitment: B256 = commitment.parse()?;
 
@@ -436,11 +395,8 @@ impl BillingClient {
     }
 }
 
-/// Recover the signer address from a SpendAuth EIP-712 signature.
-///
-/// The caller MUST compare the returned address against the account's on-chain
-/// spending key to authenticate the request. Also checks expiry with clock skew
-/// tolerance.
+/// Recovers the EIP-712 SpendAuth signer and checks expiry with clock-skew tolerance.
+/// Callers must compare it with the account's on-chain spending key before serving.
 pub fn recover_spend_auth_signer(
     auth: &SpendAuthPayload,
     shielded_credits_addr: &str,
@@ -478,7 +434,6 @@ pub fn recover_spend_auth_signer(
     let pubkey_hash = keccak256(&pubkey_bytes.as_bytes()[1..]);
     let recovered_address = Address::from_slice(&pubkey_hash[12..]);
 
-    // Check expiry with clock skew tolerance
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| "system clock is before UNIX epoch".to_string())?

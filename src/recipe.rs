@@ -1,12 +1,15 @@
 use anyhow::{ensure, Context, Result};
 use blueprint_core::gpu::GpuClass;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub const ENGINE_PROFILES: &str = include_str!("../engine-profiles.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecipeCatalog {
+    #[serde(skip)]
+    source_sha256: String,
     pub image: String,
     pub common_args: Vec<String>,
     pub families: BTreeMap<String, FamilyRecipe>,
@@ -90,6 +93,7 @@ impl ThroughputMeasurement {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRecipe {
+    pub catalog_sha256: String,
     pub image: String,
     pub family: String,
     pub arm: String,
@@ -101,12 +105,16 @@ pub struct ResolvedRecipe {
 }
 
 impl RecipeCatalog {
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
+    }
+
     pub fn bundled() -> Result<Self> {
         Self::from_json(ENGINE_PROFILES)
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
-        let catalog: Self = serde_json::from_str(json)?;
+        let mut catalog: Self = serde_json::from_str(json)?;
         ensure!(
             catalog
                 .image
@@ -154,6 +162,7 @@ impl RecipeCatalog {
                 "measurement requires immutable model, engine, manifest and raw-result provenance"
             );
         }
+        catalog.source_sha256 = format!("{:x}", Sha256::digest(json.as_bytes()));
         Ok(catalog)
     }
 
@@ -244,6 +253,7 @@ impl RecipeCatalog {
             set_option(&mut args, &["--revision"], "--revision", revision);
         }
         Ok(ResolvedRecipe {
+            catalog_sha256: self.source_sha256().to_owned(),
             image: self.image.clone(),
             family: family.into(),
             arm: arm.into(),

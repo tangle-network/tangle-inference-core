@@ -46,6 +46,8 @@ pub struct EngineConfig {
     #[serde(default = "default_arm")]
     pub recipe_arm: String,
     #[serde(default)]
+    pub recipe_catalog: Option<PathBuf>,
+    #[serde(default)]
     pub gpu_class: Option<String>,
     pub model: String,
     #[serde(default = "default_context")]
@@ -112,6 +114,7 @@ impl Default for EngineConfig {
             engine: EngineKind::default(),
             base_family: None,
             recipe_arm: default_arm(),
+            recipe_catalog: None,
             gpu_class: None,
             model: String::new(),
             max_model_len: default_context(),
@@ -136,7 +139,17 @@ impl EngineConfig {
             self.engine == EngineKind::Sglang,
             "family catalog contains SGLang recipes"
         );
-        self.recipe_from(&RecipeCatalog::bundled()?)
+        self.recipe_from(&self.load_catalog()?)
+    }
+
+    fn load_catalog(&self) -> Result<RecipeCatalog> {
+        match &self.recipe_catalog {
+            Some(path) => RecipeCatalog::from_json(
+                &std::fs::read_to_string(path)
+                    .context("could not read the engine recipe catalog")?,
+            ),
+            None => RecipeCatalog::bundled(),
+        }
     }
 
     fn recipe_from(&self, catalog: &RecipeCatalog) -> Result<ResolvedRecipe> {
@@ -236,6 +249,7 @@ impl EngineConfig {
 struct EngineChild {
     child: Child,
     health_url: String,
+    identity: crate::runtime::ChildIdentity,
     #[cfg(unix)]
     group: i32,
 }
@@ -277,6 +291,7 @@ pub struct EngineProcess {
     cancel_start: watch::Sender<u64>,
     stopped: AtomicBool,
     recipe: Option<ResolvedRecipe>,
+    verified_manifest: Mutex<Option<String>>,
     config: EngineConfig,
     client: reqwest::Client,
     managed: bool,
@@ -290,6 +305,7 @@ impl EngineProcess {
             cancel_start: watch::channel(0).0,
             stopped: AtomicBool::new(false),
             recipe: None,
+            verified_manifest: Mutex::new(None),
             config,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(300))
@@ -299,7 +315,8 @@ impl EngineProcess {
     }
 
     pub async fn spawn(config: EngineConfig) -> Result<Self> {
-        Self::spawn_with_catalog(config, &RecipeCatalog::bundled()?).await
+        let catalog = config.load_catalog()?;
+        Self::spawn_with_catalog(config, &catalog).await
     }
 
     pub async fn spawn_with_catalog(config: EngineConfig, catalog: &RecipeCatalog) -> Result<Self> {
@@ -322,7 +339,7 @@ impl EngineProcess {
         process.recipe = recipe;
         process.managed = true;
         if process.config.weights.is_none() {
-            *process.children.lock().await = process.spawn_children(None)?;
+            *process.children.lock().await = process.spawn_children(None).await?;
         }
         Ok(process)
     }
@@ -356,11 +373,17 @@ impl EngineProcess {
             !self.stopped.load(Ordering::Acquire) && *cancelled.borrow() == generation,
             "engine startup cancelled"
         );
-        *children = self.spawn_children(verified.as_ref().map(|weights| weights.model_dir()))?;
+        *children = self
+            .spawn_children(verified.as_ref().map(|weights| weights.model_dir()))
+            .await?;
+        *self.verified_manifest.lock().await = verified
+            .as_ref()
+            .and(self.config.weights.as_ref())
+            .map(|weights| weights.source.manifest_sha.to_ascii_lowercase());
         Ok(())
     }
 
-    fn spawn_children(&self, model_dir: Option<&Path>) -> Result<Vec<EngineChild>> {
+    async fn spawn_children(&self, model_dir: Option<&Path>) -> Result<Vec<EngineChild>> {
         let mut children = Vec::new();
         let devices: Option<Vec<_>> = std::env::var("CUDA_VISIBLE_DEVICES")
             .ok()
@@ -431,7 +454,7 @@ impl EngineProcess {
             } else {
                 self.endpoint()
             };
-            children.push(self.spawn_child(&argv, env, endpoint)?);
+            children.push(self.spawn_child(&argv, env, endpoint).await?);
         }
         if self.config.engine == EngineKind::Sglang {
             let mut argv: Vec<String> = if self.config.router_command.is_empty() {
@@ -458,12 +481,15 @@ impl EngineProcess {
                 "--worker-urls".into(),
             ]);
             argv.extend(urls);
-            children.push(self.spawn_child(&argv, Default::default(), self.endpoint())?);
+            children.push(
+                self.spawn_child(&argv, Default::default(), self.endpoint())
+                    .await?,
+            );
         }
         Ok(children)
     }
 
-    fn spawn_child(
+    async fn spawn_child(
         &self,
         argv: &[String],
         env: std::collections::BTreeMap<String, String>,
@@ -523,12 +549,15 @@ impl EngineProcess {
             }
         }
         tracing::info!(pid = child.id(), engine = ?self.config.engine, "spawned serving engine");
-        Ok(EngineChild {
+        let mut owned = EngineChild {
+            identity: Default::default(),
             health_url: format!("{endpoint}/health"),
             #[cfg(unix)]
             group: child.id().context("serving engine has no pid")? as i32,
             child,
-        })
+        };
+        owned.identity = crate::runtime::child_identity(&owned.child, argv).await;
+        Ok(owned)
     }
 
     pub fn client(&self) -> &reqwest::Client {
@@ -553,9 +582,111 @@ impl EngineProcess {
         format!("http://{host}:{}", self.config.port)
     }
 
+    /// Observed process facts are distinct from the declared recipe and image.
+    pub async fn runtime_info(&self) -> Result<serde_json::Value> {
+        use sha2::{Digest, Sha256};
+        let processes: Vec<_> = self
+            .children
+            .try_lock()
+            .context("engine runtime is changing")?
+            .iter()
+            .map(|child| child.identity.clone())
+            .collect();
+        let ready = self.is_healthy().await;
+        let models = if ready {
+            self.observed_json("/v1/models").await.and_then(|value| {
+                Some(
+                    value
+                        .get("data")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|row| row.get("id")?.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>(),
+                )
+            })
+        } else {
+            None
+        };
+        let observed = if ready {
+            self.observed_json("/get_server_info").await.map(|value| {
+                let mut fields = serde_json::Map::new();
+                for name in [
+                    "version",
+                    "served_model_name",
+                    "tp_size",
+                    "dp_size",
+                    "pp_size",
+                    "dtype",
+                    "quantization",
+                ] {
+                    if let Some(item) = value
+                        .get(name)
+                        .or_else(|| value.get("server_args")?.get(name))
+                    {
+                        fields.insert(name.into(), item.clone());
+                    }
+                }
+                serde_json::Value::Object(fields)
+            })
+        } else {
+            None
+        };
+        let mut facts = serde_json::json!({
+            "core": crate::runtime::core_source(),
+            "operator_sha256": crate::runtime::operator_executable_sha256().await,
+            "processes": processes, "managed": self.managed,
+            "verified_manifest_sha256": self.verified_manifest.lock().await.clone(),
+            "served_models": models, "observed_runtime": observed,
+            "verified_image_digest": null,
+            "recipe": self.recipe.as_ref().map(|recipe| serde_json::json!({
+                "catalog_sha256": recipe.catalog_sha256, "declared_image": recipe.image,
+                "family": recipe.family, "arm": recipe.arm, "gpu_class": recipe.gpu.id,
+                "vram_gb_per_gpu": recipe.gpu.vram_gb, "tp": self.config.tensor_parallel_size,
+                "replicas": self.config.replicas, "model": recipe.model, "revision": recipe.revision,
+            })),
+        });
+        let current = self
+            .children
+            .try_lock()
+            .context("engine runtime is changing")?;
+        ensure!(
+            current
+                .iter()
+                .map(|child| child.child.id())
+                .eq(processes.iter().map(|child| child.pid)),
+            "engine changed during runtime observation"
+        );
+        facts["runtime_fingerprint"] =
+            format!("{:x}", Sha256::digest(serde_json::to_vec(&facts)?)).into();
+        facts["ready"] = ready.into();
+        Ok(facts)
+    }
+
+    async fn observed_json(&self, path: &str) -> Option<serde_json::Value> {
+        let mut response = self
+            .client
+            .get(format!("{}{path}", self.endpoint()))
+            .timeout(Duration::from_secs(1))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if chunk.len() > (64 * 1024usize).saturating_sub(bytes.len()) {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).ok()
+    }
+
     pub async fn is_healthy(&self) -> bool {
         let urls = if self.managed {
-            let mut children = self.children.lock().await;
+            let Ok(mut children) = self.children.try_lock() else {
+                return false;
+            };
             if children.is_empty()
                 || children
                     .iter_mut()
@@ -628,6 +759,7 @@ impl EngineProcess {
         while let Some(mut child) = children.pop() {
             child.terminate().await;
         }
+        *self.verified_manifest.lock().await = None;
     }
 
     pub async fn restart(&self) -> Result<()> {

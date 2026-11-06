@@ -3,6 +3,7 @@ pub mod engine;
 pub mod health;
 pub mod operator;
 pub mod recipe;
+pub mod runtime;
 pub mod weights;
 
 #[cfg(all(feature = "billing", feature = "metrics"))]
