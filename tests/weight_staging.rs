@@ -147,36 +147,6 @@ fn assert_empty(path: &std::path::Path) {
 }
 
 #[tokio::test]
-async fn tampered_shard_never_publishes_and_verified_cache_works_offline() {
-    let origin = Origin::start().await;
-    let source = origin.manifest(serde_json::json!([origin.file("weights.bin")]), 5);
-    origin.serve("/weights", b"HELLO".to_vec());
-    let destination = tempfile::tempdir().unwrap();
-    let limits = fixture_limits();
-    let manifest_url = format!("{}/manifest", origin.url);
-    assert!(
-        stage_weights(&manifest_url, &source, destination.path(), &limits)
-            .await
-            .is_err(),
-        "same-sized tampered shard accepted"
-    );
-    assert_empty(destination.path());
-    origin.serve("/weights", b"hello".to_vec());
-    let verified = stage_weights(&manifest_url, &source, destination.path(), &limits)
-        .await
-        .unwrap();
-    assert_eq!(
-        std::fs::read(verified.model_dir().join("weights.bin")).unwrap(),
-        b"hello"
-    );
-    drop(origin);
-    let cached = stage_weights(&manifest_url, &source, destination.path(), &limits)
-        .await
-        .unwrap();
-    assert_eq!(cached.model_dir(), verified.model_dir());
-}
-
-#[tokio::test]
 async fn whole_manifest_is_checked_before_any_shard_fetch() {
     let origin = Origin::start().await;
     let limits = fixture_limits();
@@ -295,11 +265,12 @@ async fn origin_policy_and_byte_limits_refuse_downloads_before_publication() {
 }
 
 #[tokio::test]
-async fn truncated_and_oversized_chunked_shards_leave_no_partial_model() {
+async fn tampered_truncated_and_oversized_shards_leave_no_partial_model() {
     let origin = Origin::start().await;
     let source = origin.manifest(serde_json::json!([origin.file("weights.bin")]), 5);
     let destination = tempfile::tempdir().unwrap();
     for wire in [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO".to_vec(),
         b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhe".to_vec(),
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n1\r\n!\r\n0\r\n\r\n".to_vec(),
     ] {
@@ -321,6 +292,10 @@ async fn cache_changes_are_refused_offline_without_repairing_or_deleting_data() 
         .await
         .unwrap();
     drop(origin);
+    let cached = stage_weights(&url, &source, destination.path(), &fixture_limits())
+        .await
+        .unwrap();
+    assert_eq!(cached.model_dir(), verified.model_dir());
     let file = verified.model_dir().join("nested/weights.bin");
     std::fs::write(&file, b"HELLO").unwrap();
     assert!(
@@ -433,9 +408,32 @@ async fn concurrent_publishers_reuse_the_verified_winner() {
     .unwrap();
     let (first, second) = (first.unwrap(), second.unwrap());
     assert_eq!(first.model_dir(), second.model_dir());
-    assert_eq!(
-        std::fs::read(first.model_dir().join("weights.bin")).unwrap(),
-        b"hello"
+    assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn empty_cache_created_during_download_is_never_replaced() {
+    let origin = Origin::start().await;
+    let source = origin.manifest(serde_json::json!([origin.file("weights.bin")]), 5);
+    let barrier = Arc::new(Barrier::new(2));
+    origin.reply(
+        "/weights",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec(),
+        false,
+        Some(barrier.clone()),
     );
+    let destination = tempfile::tempdir().unwrap();
+    let published = destination.path().join(&source.manifest_sha);
+    let target = destination.path().to_owned();
+    let url = format!("{}/manifest", origin.url);
+    let staging =
+        tokio::spawn(async move { stage_weights(&url, &source, &target, &fixture_limits()).await });
+    tokio::time::timeout(Duration::from_secs(5), origin.wait_for_request("/weights"))
+        .await
+        .unwrap();
+    std::fs::create_dir(&published).unwrap();
+    barrier.wait().await;
+    assert!(staging.await.unwrap().is_err(), "replaced existing cache");
+    assert_empty(&published);
     assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 1);
 }
