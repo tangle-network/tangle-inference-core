@@ -1,7 +1,7 @@
-use tangle_inference_core::engine::{EngineConfig, RecipeCatalog, ENGINE_PROFILES};
+use tangle_inference_core::engine::{EngineConfig, EngineProcess, RecipeCatalog, ENGINE_PROFILES};
 
-#[test]
-fn invalid_recipe_selections_are_rejected() -> anyhow::Result<()> {
+#[tokio::test]
+async fn invalid_recipe_selections_are_rejected() -> anyhow::Result<()> {
     for (family, arm, gpu) in [
         ("deepseek-v4.1-flash-1017", "native", "H200"),
         ("deepseek-v4.1-flash-1017", "native", "nvidia-a100"),
@@ -13,7 +13,7 @@ fn invalid_recipe_selections_are_rejected() -> anyhow::Result<()> {
             "model": "acme/derived-deepseek", "gpu_class": gpu, "tensor_parallel_size": 8
         }))?;
         assert!(
-            config.argv().is_err(),
+            EngineProcess::spawn(config).await.is_err(),
             "accepted unsupported {family}/{arm}/{gpu}"
         );
     }

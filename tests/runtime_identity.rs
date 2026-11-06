@@ -85,12 +85,18 @@ async fn runtime_identity_follows_own_running_inodes() -> Result<()> {
     let replacement = directory.path().join("replacement");
     std::fs::write(&replacement, b"replacement is not the running executable")?;
     std::fs::rename(replacement, &running)?;
-    let identity = child_identity(&child, &argv).await;
+    let identity = child_identity(&child).await;
     assert_eq!(identity.pid, child.id());
     assert_eq!(identity.executable_sha256.as_deref(), Some(expected));
     assert_eq!(
         identity.argv_sha256,
-        Some(format!("{:x}", Sha256::digest(serde_json::to_vec(&argv)?)))
+        Some(format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(format!(
+                "/proc/{}/cmdline",
+                child.id().unwrap()
+            ))?)
+        ))
     );
     let wire = serde_json::to_string(&identity)?;
     assert!(!wire.contains("runtime-probe") && !wire.contains("--nocapture"));

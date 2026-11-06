@@ -25,7 +25,7 @@ pub fn core_source() -> CoreSource {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ChildIdentity {
     pub pid: Option<u32>,
     pub executable_sha256: Option<String>,
@@ -35,29 +35,30 @@ pub struct ChildIdentity {
 /// Hash the actual running inode; a replaced pathname cannot substitute its bytes.
 pub async fn operator_executable_sha256() -> Option<String> {
     static HASH: OnceCell<Option<String>> = OnceCell::const_new();
-    HASH.get_or_init(|| executable_hash(PathBuf::from("/proc/self/exe")))
+    HASH.get_or_init(|| file_sha256(PathBuf::from("/proc/self/exe")))
         .await
         .clone()
 }
 
-/// argv is the exact supplied vector, including the executable. Keep the owned
-/// child/drop guard alive during observation; no plaintext arguments leave here.
-pub async fn child_identity(child: &Child, argv: &[String]) -> ChildIdentity {
+/// Observe only the owned child; arguments are hashed as raw NUL-separated
+/// process bytes, never returned or logged as plaintext.
+pub async fn child_identity(child: &Child) -> ChildIdentity {
     let pid = child.id();
-    let executable_sha256 = match pid {
-        Some(pid) => executable_hash(PathBuf::from(format!("/proc/{pid}/exe"))).await,
-        None => None,
+    let (executable_sha256, argv_sha256) = match pid {
+        Some(pid) => (
+            file_sha256(PathBuf::from(format!("/proc/{pid}/exe"))).await,
+            file_sha256(PathBuf::from(format!("/proc/{pid}/cmdline"))).await,
+        ),
+        None => (None, None),
     };
     ChildIdentity {
         pid,
         executable_sha256,
-        argv_sha256: serde_json::to_vec(argv)
-            .ok()
-            .map(|bytes| format!("{:x}", Sha256::digest(bytes))),
+        argv_sha256,
     }
 }
 
-async fn executable_hash(path: PathBuf) -> Option<String> {
+async fn file_sha256(path: PathBuf) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         tokio::task::spawn_blocking(move || {
