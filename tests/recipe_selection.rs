@@ -18,6 +18,13 @@ fn selected_gpu_recipe_reaches_sglang_instead_of_silently_using_blackwell_flags(
         .iter()
         .any(|arg| arg == "--enable-decoder-swa-bounded-replay"));
     assert!(!argv.iter().any(|arg| arg.contains("{tp}")));
+    value["gpu_class"] = serde_json::json!("H200");
+    assert!(
+        serde_json::from_value::<EngineConfig>(value.clone())?
+            .argv()
+            .is_err(),
+        "GPU aliases must not cross the recipe boundary; use the SDK catalog id"
+    );
     value["gpu_class"] = serde_json::json!("nvidia-a100");
     assert!(serde_json::from_value::<EngineConfig>(value.clone())?
         .argv()
