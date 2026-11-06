@@ -34,7 +34,7 @@ macro_rules! run_operator {
             $crate::run_operator!(@heartbeat config, $qos);
             blueprint_sdk::runner::BlueprintRunner::builder(
                 blueprint_sdk::runner::tangle::config::TangleConfig::default(), env)
-                .router($router)
+                .router(($router)(config.clone()))
                 .producer(blueprint_sdk::tangle::TangleProducer::new(client.clone(), service_id))
                 .consumer(blueprint_sdk::tangle::TangleConsumer::new(client))
                 .background_service(($service)(config))

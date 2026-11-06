@@ -9,15 +9,17 @@ abstract contract InferenceBSMBase is BlueprintServiceManagerBase {
         require(registry != address(0), "Tangle registry required");
         if (tangleCore != address(0)) revert AlreadyInitialized();
         tangleCore = registry;
+        blueprintOwner = msg.sender;
+        blueprintId = type(uint64).max;
     }
 
     function onBlueprintCreated(uint64 id, address owner, address registry) external override {
         if (tangleCore == address(0) || msg.sender != tangleCore || registry != tangleCore) {
             revert OnlyTangleAllowed(msg.sender, tangleCore);
         }
-        if (blueprintOwner != address(0)) revert AlreadyInitialized();
-        require(owner != address(0), "Blueprint owner required");
+        if (blueprintId != type(uint64).max) revert AlreadyInitialized();
+        require(owner == blueprintOwner, "Unexpected blueprint creator");
+        require(id != type(uint64).max, "Invalid blueprint id");
         blueprintId = id;
-        blueprintOwner = owner;
     }
 }

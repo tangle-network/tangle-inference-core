@@ -28,6 +28,14 @@
         "gpu_overrides": {"H100": {"args": ["--ep-size", "1", "--moe-runner-backend", "marlin", "--enable-decoder-swa-bounded-replay"], "env": {"SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "0"}}, "H200": {"args": ["--ep-size", "1", "--moe-runner-backend", "marlin", "--enable-decoder-swa-bounded-replay"], "env": {"SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "0"}}, "B200": {"args": ["--ep-size", "{tp}", "--moe-runner-backend", "flashinfer_mxfp4"], "env": {}}},
         "status": "Unvalidated 1017 candidates: DP attention uses attn-dp-size=TP with MoE A2A none; bundled three-stage DSpark uses checkpoint block size5. No separate validated MTP/EAGLE recipe is asserted. All local KV headroom, quality and performance remain unmeasured.",
         "hopper_source": "https://github.com/sgl-project/sglang/pull/41251", "hopper_merge_revision": "391e665dab9b3d00f0a614a9a0f36306c279aea3", "hopper_status": "Merge is an ancestor of v0.5.23. PR measured original Flash on8H200 TP8/EP1 Marlin, bounded SWA and GPU-resident Engram, without DP attention or speculation; H100,1017,DP+DSpark combination and4H200 remain experiments."}}
+    },
+    "qwen3": {
+      "parent_model": "Qwen/Qwen3-0.6B", "architecture": "Qwen3ForCausalLM",
+      "license": "Apache-2.0; preserve copyright and license notices",
+      "license_url": "https://huggingface.co/Qwen/Qwen3-0.6B/blob/main/LICENSE",
+      "args": ["--reasoning-parser", "qwen3", "--tool-call-parser", "qwen25"],
+      "arms": {"native": {"quantization": {}, "gpus": [], "recipe_tp": {}, "args": []}},
+      "recipe": "https://github.com/QwenLM/Qwen3/blob/main/docs/source/deployment/sglang.md"
     }
   }
 }

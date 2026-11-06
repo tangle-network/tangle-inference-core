@@ -12,7 +12,8 @@ fn config(engine: EngineKind) -> EngineConfig {
             .local_addr()
             .unwrap()
             .port(),
-        tensor_parallel_size: 1,
+        tensor_parallel_size: 8,
+        gpu_class: Some("nvidia-h200".into()),
         max_model_len: 4096,
         startup_timeout_secs: 5,
         ..EngineConfig::default()
@@ -36,7 +37,7 @@ fn catalog_exports_real_family_recipes_and_sglang_argv() -> anyhow::Result<()> {
         "flashinfer_mxfp4"
     );
     assert_eq!(option(&deepseek.args, "--attention-backend"), "dsv4");
-    assert_eq!(option(&deepseek.args, "--ep-size"), "8");
+    assert_eq!(option(&deepseek.args, "--ep-size"), "1");
     assert_eq!(
         option(&deepseek.args, "--model-path"),
         "deepseek-ai/DeepSeek-V4.1-Flash-1017"
@@ -47,7 +48,7 @@ fn catalog_exports_real_family_recipes_and_sglang_argv() -> anyhow::Result<()> {
     let argv = cfg.argv()?;
     assert_eq!(&argv[..3], ["python3", "-m", "sglang.launch_server"]);
     assert_eq!(option(&argv, "--model-path"), cfg.model);
-    assert_eq!(option(&argv, "--tp"), "1");
+    assert_eq!(option(&argv, "--tp"), "8");
     assert_eq!(option(&argv, "--context-length"), "4096");
     assert!(argv.contains(&"--enable-cache-report".into()));
     assert!(!argv.contains(&"--max-model-len".into()));
@@ -61,7 +62,7 @@ fn catalog_exports_real_family_recipes_and_sglang_argv() -> anyhow::Result<()> {
         ["python3", "-m", "vllm.entrypoints.openai.api_server"]
     );
     assert_eq!(option(&argv, "--max-model-len"), "4096");
-    assert_eq!(option(&argv, "--tensor-parallel-size"), "1");
+    assert_eq!(option(&argv, "--tensor-parallel-size"), "8");
     Ok(())
 }
 
@@ -78,7 +79,7 @@ p.add_argument("--port", type=int)
 p.add_argument("--host")
 a, _ = p.parse_known_args()
 with open(a.receipt, "w") as f:
-    json.dump({"args": sys.argv[2:], "token_in_env": os.environ.get("HF_TOKEN") == "test-only-token"}, f)
+    json.dump({"args": sys.argv[2:], "token_in_env": os.environ.get("HF_TOKEN") == "test-only-token", "hopper_env": os.environ.get("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE")}, f)
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/crash": os._exit(42)
@@ -97,6 +98,10 @@ async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let (script, receipt) = child_script(dir.path())?;
         let mut cfg = config(engine);
+        if engine == EngineKind::Sglang {
+            cfg.base_family = Some("deepseek-v4.1-flash-1017".into());
+            cfg.model = "acme/derived-deepseek".into();
+        }
         cfg.command = format!("python3 {} {}", script.display(), receipt.display());
         cfg.hf_token = Some("test-only-token".into());
         cfg.download_dir = Some(dir.path().join("model cache"));
@@ -129,6 +134,9 @@ async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
             dir.path().join("model cache").to_str().unwrap()
         );
         assert_eq!(receipt["token_in_env"], true);
+        if engine == EngineKind::Sglang {
+            assert_eq!(receipt["hopper_env"], "0");
+        }
         assert!(!argv.iter().any(|arg| arg.contains("test-only-token")));
         process.restart().await?;
         assert!(process.is_healthy().await);

@@ -114,7 +114,6 @@ fn spend_auth_signature_round_trip() {
         .concat(),
     );
 
-    // Sign with the underlying k256 signing key.
     let key_bytes = hex::decode(key_hex).unwrap();
     let signing_key = k256::ecdsa::SigningKey::from_slice(&key_bytes).unwrap();
     let (sig, recid): (Signature, RecoveryId) =
@@ -136,7 +135,6 @@ fn spend_auth_signature_round_trip() {
         signature: signature_hex,
     };
 
-    // Recover and verify.
     let recovered =
         recover_spend_auth_signer(&payload, shielded_credits_addr, chain_id, 30).unwrap();
     assert_eq!(recovered, signing_address);
@@ -150,7 +148,6 @@ fn spend_auth_signature_round_trip() {
     )
     .expect("matching signer");
 
-    // Mismatched expected key -> Err.
     let other: Address = "0x000000000000000000000000000000000000bEEF"
         .parse()
         .unwrap();
@@ -176,7 +173,6 @@ async fn nonce_store_persists_across_reload() {
     store.insert(key.clone(), expiry, 30).await;
     assert!(store.check_replay(&key, 30).await);
 
-    // Reload from disk.
     let reloaded = NonceStore::load(Some(path));
     assert!(reloaded.check_replay(&key, 30).await);
 }
@@ -532,18 +528,15 @@ mod anvil_e2e {
         let anvil = AnvilInstance::spawn();
         let rpc = anvil.rpc_url();
 
-        // Deployer = Anvil account #0 (same as operator key)
         let deployer_signer: PrivateKeySigner = TEST_OPERATOR_KEY.parse().unwrap();
         let deployer_wallet = EthereumWallet::from(deployer_signer.clone());
         let deployer_provider = ProviderBuilder::new()
             .wallet(deployer_wallet)
             .connect_http(rpc.parse().unwrap());
 
-        // Deploy test ERC-20
         let token = TestToken::deploy(&deployer_provider).await.unwrap();
         let token_addr = *token.address();
 
-        // Mint 1M tokens to the caller (account #1)
         let caller_signer: PrivateKeySigner = CALLER_KEY.parse().unwrap();
         let caller_addr = caller_signer.address();
         let mint_amount = U256::from(1_000_000u64);
@@ -556,11 +549,9 @@ mod anvil_e2e {
             .await
             .unwrap();
 
-        // Verify balance
         let bal = token.balanceOf(caller_addr).call().await.unwrap();
         assert_eq!(bal, mint_amount);
 
-        // Caller transfers 500K to operator
         let caller_wallet = EthereumWallet::from(caller_signer);
         let caller_provider = ProviderBuilder::new()
             .wallet(caller_wallet)
@@ -580,7 +571,6 @@ mod anvil_e2e {
 
         let tx_hash = format!("{:#x}", tx_receipt.transaction_hash);
 
-        // Now: DirectProvider should authorize this transfer
         let provider = DirectProvider::new(
             rpc.clone(),
             TEST_OPERATOR_KEY.into(),
@@ -605,7 +595,6 @@ mod anvil_e2e {
         );
         assert_eq!(authorized.unwrap(), 500_000);
 
-        // Settle should be a no-op
         let settle = provider.settle(&proof, 400_000).await;
         assert!(settle.is_ok());
     }

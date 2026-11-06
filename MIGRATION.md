@@ -6,9 +6,9 @@ protection, GPU health, metrics, QoS and the SDK runner boilerplate.
 Blueprints retain their HTTP adapters, model rules, pricing and chain job schemas.
 
 - Import `engine::{EngineConfig, EngineKind, EngineProcess, RecipeCatalog}`.
-  SGLang requires `base_family`; derivatives inherit that family's recipe while
-  changing `model`. New families are catalog entries. `external` attaches an
-  existing backend. Never relabel a derivative as an unrelated family.
+  Derivatives name `base_family`; select `recipe_arm`, `gpu_class` and tensor
+  parallelism. Core applies arm/GPU args and env, rejecting unsupported shapes.
+  `external` attaches an existing backend.
 - Expand `run_operator!` with the adapter's registration payload, router and
   background service. Reuse `qos::{QoSConfig, start_heartbeat}`.
 - Inherit `contracts/InferenceBSMBase.sol` and bind the trusted registry in the
