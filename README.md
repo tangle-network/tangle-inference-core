@@ -1,149 +1,67 @@
 # tangle-inference-core
 
-Shared infrastructure for building Tangle inference operator blueprints. Handles billing, x402 payment validation, nonce replay protection, Prometheus metrics, and GPU health — so your blueprint only needs to implement inference.
+Run inference operators with shared SGLang/vLLM supervision, model-family recipes,
+HTTP payment gates, metered settlement, replay protection, metrics and QoS.
+Blueprints supply their request adapters, prices and model admission rules.
 
-```toml
-[dependencies]
-tangle-inference-core = { git = "https://github.com/tangle-network/tangle-inference-core", branch = "master" }
+Pin this crate by full Git commit. [MIGRATION.md](MIGRATION.md) describes the
+consumer imports, shared runner and deployment scripts.
+
+## Serve a model family
+
+```rust,no_run
+use tangle_inference_core::engine::{EngineConfig, EngineKind, EngineProcess};
+
+# async fn example() -> anyhow::Result<()> {
+let engine = EngineProcess::spawn(EngineConfig {
+    engine: EngineKind::Sglang,
+    base_family: Some("qwen3".into()),
+    model: "Qwen/Qwen3-0.6B".into(),
+    tensor_parallel_size: 1,
+    ..EngineConfig::default()
+}).await?;
+engine.wait_ready().await?;
+// Run supervise with the operator's shutdown receiver while serving requests.
+engine.shutdown().await;
+# Ok(())
+# }
 ```
 
-## Quick Start
+[engine-profiles.json](engine-profiles.json) owns the pinned SGLang image and
+family flags. Its initial import preserves abliterated-inference's catalog bytes.
+A derivative sets `base_family` and changes `model`; a new family adds a catalog
+entry. `RecipeCatalog::resolve` returns the image and argv for lease preparation.
+Install the engine in that image; core supervises its process on the node.
+Blueprint-specific chain admission and price configuration remain separate.
 
-```rust
-use std::sync::Arc;
-use tangle_inference_core::{
-    AppState, AppStateBuilder, BillingClient, NonceStore,
-    BillingConfig, ServerConfig, TangleConfig,
-};
+`EngineProcess::connect` attaches an external server, including the existing
+operator-lite/Ollama path. Managed engines run in their own process group so
+shutdown and restart also terminate workers.
 
-// Your inference backend — any Send + Sync + 'static type
-struct MyBackend { /* vLLM handle, Ollama client, etc. */ }
+## Register and bill
 
-// Build the shared operator state
-let state: AppState = AppStateBuilder::new()
-    .billing(Arc::new(BillingClient::new(&tangle_config, &billing_config)?))
-    .nonce_store(Arc::new(NonceStore::load(billing_config.nonce_store_path.clone())))
-    .server_config(Arc::new(server_config))
-    .billing_config(Arc::new(billing_config))
-    .tangle_config(Arc::new(tangle_config))
-    .operator_address(operator_address)
-    .backend(MyBackend { /* ... */ })
-    .build()?;
+The shared [registration script](contracts/script/RegisterBlueprint.s.sol) reads
+`metadata.profiling_data` from the blueprint definition and sends it unchanged to
+Tangle. Each blueprint provides its manager deployment adapter.
 
-// In your axum handler — retrieve backend + validate payments
-async fn chat(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<Request>) -> Response {
-    let backend = state.backend::<MyBackend>().unwrap();
+`AppStateBuilder`, `billing_gate` and `settle_billing` share authorization and
+settlement. Pass the metered cost as `Some(cost)`; `None` claims the full preauth.
+Keep nonce and direct-transfer replay stores persistent across operator restarts.
+`qos::start_heartbeat` submits the same core metrics used by the HTTP endpoints.
 
-    // Extract and validate x402 SpendAuth
-    let spend_auth = extract_x402_spend_auth(&headers).unwrap();
-    let preauth = validate_spend_auth(&state, &spend_auth).await?;
+GPU detection and class/VRAM requirements follow the blueprint SDK's released API.
+The D9 lane STATUS records the pending SDK migration; no GPU catalog is owned here.
 
-    // Run inference
-    let result = backend.generate(&req).await;
+## Check changes
 
-    // Settle on-chain (authorizeSpend before serving, settlePayment after —
-    // the contract charges the metered cost and refunds the unused pre-auth;
-    // pass None instead of Some(cost) when usage metering is unavailable to
-    // fall back to a full-pre-auth claimPayment)
-    let cost = my_cost_model.calculate_cost(&CostParams {
-        prompt_tokens: result.prompt_tokens,
-        completion_tokens: result.completion_tokens,
-        ..Default::default()
-    });
-    settle_billing(&state.billing, &spend_auth, preauth, Some(cost)).await;
-
-    Json(result).into_response()
-}
-```
-
-## Modules
-
-| Module | What it does |
-|--------|-------------|
-| **`billing`** | `BillingClient` — submits `authorizeSpend` and settlement (`settlePayment` metered / `claimPayment` full pre-auth fallback) txs to ShieldedCredits via alloy. EIP-712 signature recovery. Gas price cap. Retry with exponential backoff. |
-| **`server`** | `AppState` + builder, `NonceStore` (file-backed replay protection), `validate_spend_auth`, `settle_billing`, `extract_x402_spend_auth`, `payment_required`, `error_response` |
-| **`metrics`** | Global Prometheus registry. `RequestGuard` RAII — tracks latency, tokens, TTFT, active requests. `on_chain_metrics()` for QoS heartbeat. |
-| **`health`** | `detect_gpus()` — parses `nvidia-smi`, returns `Vec<GpuInfo>` |
-| **`config`** | `TangleConfig`, `BillingConfig`, `ServerConfig`, `GpuConfig` with serde + sensible defaults |
-
-## Cost Models
-
-Implement `CostModel` or use one of the built-in implementations:
-
-```rust
-pub trait CostModel: Send + Sync + 'static {
-    fn calculate_cost(&self, params: &CostParams) -> u64;
-}
-```
-
-| Model | Use case | Pricing input |
-|-------|----------|---------------|
-| `PerTokenCostModel` | LLM chat/completion | input + output tokens |
-| `PerCharCostModel` | Text-to-speech | characters |
-| `PerSecondCostModel` | Speech-to-text, video | centiseconds |
-| `PerImageCostModel` | Image generation | image count |
-| `FlatRequestCostModel` | Embeddings | flat fee per request |
-| `TaskTypeCostModel` | Multi-task (Modal) | dispatches by task type |
-
-## SpendAuth Validation
-
-`validate_spend_auth` performs the full pre-flight check in order:
-
-1. Parse amount
-2. Enforce min charge + max spend policy
-3. Verify operator address matches this operator
-4. Verify service ID (if configured)
-5. Nonce replay check + record (prevents double-spend)
-6. EIP-712 signature recovery (alloy k256)
-7. On-chain spending key verification
-8. Minimum balance check
-
-Returns `Ok(preauth_amount)` or a ready-to-return HTTP error response.
-
-## SpendAuth Serde
-
-`SpendAuthPayload` accepts both camelCase and snake_case, and numeric fields accept JSON numbers or strings (JS BigInts serialize as strings):
-
-```json
-{"commitment":"0x...","serviceId":"1","jobIndex":0,"amount":"1000000","operator":"0x...","nonce":"0","expiry":"1775500000","signature":"0x..."}
-```
-
-## Backend
-
-The backend is type-erased (`Arc<dyn Any + Send + Sync>`). Attach any type via the builder, retrieve it in handlers with zero-cost downcast:
-
-```rust
-// Attach
-.backend(VllmProcess::spawn().await?)
-
-// Retrieve
-let vllm: &VllmProcess = state.backend::<VllmProcess>().unwrap();
-```
-
-## Blueprints Using This Crate
-
-- [llm-inference-blueprint](https://github.com/tangle-network/llm-inference-blueprint) (vLLM / Ollama)
-- [voice-inference-blueprint](https://github.com/tangle-network/voice-inference-blueprint) (TTS/STT)
-- [image-gen-inference-blueprint](https://github.com/tangle-network/image-gen-inference-blueprint)
-- [embedding-inference-blueprint](https://github.com/tangle-network/embedding-inference-blueprint)
-- [video-gen-inference-blueprint](https://github.com/tangle-network/video-gen-inference-blueprint)
-- [modal-inference-blueprint](https://github.com/tangle-network/modal-inference-blueprint)
-- [distributed-inference-blueprint](https://github.com/tangle-network/distributed-inference-blueprint)
-
-## Testing
-
-Before merge, merge the fresh default branch into the working branch and run affected source checks and real integration checks through the admitted Beelink launcher. Workflow/docs-only changes use YAML, content, link, diff and static checks.
-
-This comprehensive local qualification reference preserves frozen Cargo resolution, all five feature-check configurations and the existing full test, Clippy and formatting populations:
+Run the repository's admitted Beelink gate against the exact candidate commit:
 
 ```bash
-beelink-gate auto https://github.com/tangle-network/tangle-inference-core.git "$(git rev-parse HEAD)" -- sh -c 'cargo +stable fetch --locked && cargo +stable fmt -- --check && cargo +stable check --locked && cargo +stable check --locked --no-default-features && cargo +stable check --locked --features billing && cargo +stable check --locked --features http,billing && cargo +stable check --locked --features metrics && cargo +stable test --locked --all-features && cargo +stable clippy --locked --all-features --all-targets -- -D warnings'
+beelink-gate auto git@github.com:tangle-network/tangle-inference-core.git "$HEAD" -- bash -c 'cargo fmt --all -- --check && cargo check --locked --no-default-features && cargo test --locked --all-features && cargo clippy --locked --all-features --all-targets -- -D warnings && bash scripts/test-full-protocol.sh'
 ```
 
-This library has no PR or push CI gate; downstream applications retain their own release qualification.
-
-Integration tests construct a real `AppState`, exercise every `CostModel`, sign a `SpendAuthPayload` with a known keypair, round-trip it through EIP-712 recovery, and verify `NonceStore` persistence across reloads.
-
-## License
-
-Apache-2.0
+The protocol check requires Foundry and runs real Anvil payment integration.
+Engine tests use child processes and HTTP. Shared signing takes its key on stdin.
+Core changes also require the downstream operator-lite cached-token billing proof
+before merge. Consumers pin the qualified default-branch commit; this repository
+has no package-publishing workflow or hosted PR gate.

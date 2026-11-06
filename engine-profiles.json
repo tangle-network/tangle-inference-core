@@ -21,6 +21,16 @@
       "quantization": {"quant_method": "fp8", "weight_block_size": [32, 32], "scale_fmt": "ue8m0", "expert_dtype": "fp4"},
       "args": ["--ep-size", "8", "--attention-backend", "dsv4", "--moe-runner-backend", "flashinfer_mxfp4", "--cuda-graph-max-bs-decode", "64"],
       "recipe": "https://github.com/sgl-project/sglang/blob/v0.5.23/docs/src/snippets/configs/deepseek-ai/deepseek-v4_1.jsx"
+    },
+    "qwen3": {
+      "parent_model": "Qwen/Qwen3-0.6B",
+      "architecture": "Qwen3ForCausalLM",
+      "license": "Apache-2.0; preserve copyright and license notices",
+      "license_url": "https://huggingface.co/Qwen/Qwen3-0.6B/blob/main/LICENSE",
+      "precision": "Shipped BF16; no requantization",
+      "quantization": {},
+      "args": ["--tp", "1", "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen25"],
+      "recipe": "https://github.com/QwenLM/Qwen3/blob/main/docs/source/deployment/sglang.md"
     }
   }
 }
