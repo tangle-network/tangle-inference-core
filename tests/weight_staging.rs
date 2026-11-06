@@ -316,19 +316,31 @@ async fn invalid_shards_prevent_staging_and_engine_child_start() {
 
 #[tokio::test]
 async fn verified_cache_reaches_child_and_restart_refuses_offline_tampering() {
+    eprintln!("[DEBUG-n8-stack] phase=begin");
     let origin = Origin::start().await;
     let source = origin.manifest(serde_json::json!([origin.file("nested/weights.bin")]), 5);
     origin.serve("/weights", b"hello".to_vec());
     let destination = tempfile::tempdir().unwrap();
     let child = tempfile::tempdir().unwrap();
     let (config, marker) = engine_config(&origin, &source, destination.path(), child.path()).await;
-    let process = EngineProcess::spawn(config).await.unwrap();
+    let startup = EngineProcess::spawn(config);
+    eprintln!(
+        "[DEBUG-n8-stack] phase=spawn future_bytes={}",
+        std::mem::size_of_val(&startup)
+    );
+    let process = startup.await.unwrap();
     assert!(!process.is_healthy().await && !marker.exists());
     assert!(
         origin.take_requests().is_empty(),
         "spawn blocked on downloading"
     );
-    process.wait_ready().await.unwrap();
+    let ready = process.wait_ready();
+    eprintln!(
+        "[DEBUG-n8-stack] phase=ready future_bytes={}",
+        std::mem::size_of_val(&ready)
+    );
+    ready.await.unwrap();
+    eprintln!("[DEBUG-n8-stack] phase=first_child_ready");
     let launched: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
     assert_eq!(launched["served"], "acme/derived");
@@ -353,10 +365,20 @@ async fn verified_cache_reaches_child_and_restart_refuses_offline_tampering() {
     assert_eq!(origin.take_requests(), ["/manifest", "/weights"]);
     let url = format!("{}/manifest", origin.url);
     drop(origin);
-    let verified = stage_weights(&url, &source, destination.path(), &fixture_limits())
-        .await
-        .unwrap();
-    process.restart().await.unwrap();
+    let limits = fixture_limits();
+    let cache = stage_weights(&url, &source, destination.path(), &limits);
+    eprintln!(
+        "[DEBUG-n8-stack] phase=cache_verify future_bytes={}",
+        std::mem::size_of_val(&cache)
+    );
+    let verified = cache.await.unwrap();
+    let restart = process.restart();
+    eprintln!(
+        "[DEBUG-n8-stack] phase=restart future_bytes={}",
+        std::mem::size_of_val(&restart)
+    );
+    restart.await.unwrap();
+    eprintln!("[DEBUG-n8-stack] phase=restart_ready");
     let restarted: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
     assert!(launched["pid"].as_u64().unwrap() > 0 && restarted["pid"] != launched["pid"]);
@@ -364,6 +386,7 @@ async fn verified_cache_reaches_child_and_restart_refuses_offline_tampering() {
     let file = verified.model_dir().join("nested/weights.bin");
     std::fs::write(&file, b"HELLO").unwrap();
     std::fs::remove_file(&marker).unwrap();
+    eprintln!("[DEBUG-n8-stack] phase=restart_after_tamper");
     assert!(process.restart().await.is_err());
     assert!(!marker.exists() && !process.is_healthy().await);
     reject(&url, &source, destination.path(), &fixture_limits()).await;
