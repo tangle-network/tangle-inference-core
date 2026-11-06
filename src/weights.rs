@@ -7,17 +7,16 @@ use reqwest::{redirect::Policy, Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs,
     io::ErrorKind,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MANIFEST_NAME: &str = ".tangle-weights-manifest.json";
-const MANIFEST_VERSION: u32 = 1;
 static PARTIAL_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +65,8 @@ impl VerifiedWeights {
 struct Manifest {
     version: u32,
     files: Vec<Shard>,
+    #[serde(skip)]
+    entries: BTreeMap<PathBuf, bool>,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +82,7 @@ struct Shard {
 /// A cache hit is verified completely without consulting the origin. Invalid cache
 /// entries are refused rather than removed. Cancellation removes only this call's
 /// private partial directory. No model-family or engine resolution happens here.
+/// Fresh publication requires a Linux or macOS filesystem with exclusive rename.
 pub async fn stage_weights(
     manifest_url: &str,
     source: &WeightSource,
@@ -123,14 +125,12 @@ pub async fn stage_weights(
         manifest_file.sync_all().await?;
         drop(manifest_file);
         fs::File::open(partial.path())?.sync_all()?;
-        match fs::rename(partial.path(), &published) {
-            Ok(()) => partial.0 = None,
-            Err(error) => {
-                if fs::symlink_metadata(&published).is_err() {
-                    return Err(error).context("could not publish verified weights");
-                }
-                verify_cache(&published, source, limits).await?;
-            }
+        if let Err(error) = publish_directory(partial.path(), &published) {
+            verify_cache(&published, source, limits)
+                .await
+                .with_context(|| format!("could not publish verified weights: {error}"))?;
+        } else {
+            partial.0 = None;
         }
         fs::File::open(&destination)?.sync_all()?;
         Ok(VerifiedWeights {
@@ -149,23 +149,25 @@ fn validate_sha(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn digest_matches(expected: &str, actual: impl std::fmt::LowerHex) -> bool {
+    expected.eq_ignore_ascii_case(&format!("{actual:x}"))
+}
+
 fn parse_manifest(raw: &[u8], source: &WeightSource, limits: &StagingLimits) -> Result<Manifest> {
     ensure!(
-        source
-            .manifest_sha
-            .eq_ignore_ascii_case(&format!("{:x}", Sha256::digest(raw))),
+        digest_matches(&source.manifest_sha, Sha256::digest(raw)),
         "manifest digest mismatch"
     );
-    let manifest: Manifest = serde_json::from_slice(raw).context("invalid weights manifest")?;
+    let mut manifest: Manifest = serde_json::from_slice(raw).context("invalid weights manifest")?;
     ensure!(
-        manifest.version == MANIFEST_VERSION,
+        manifest.version == 1,
         "unsupported weights manifest version"
     );
     ensure!(
         !manifest.files.is_empty() && manifest.files.len() <= limits.max_files,
         "invalid manifest file count"
     );
-    let mut paths = BTreeSet::new();
+    manifest.entries.insert(PathBuf::from(MANIFEST_NAME), false);
     let mut total = 0_u64;
     for shard in &manifest.files {
         let parts: Vec<_> = shard.path.split('/').collect();
@@ -181,35 +183,62 @@ fn parse_manifest(raw: &[u8], source: &WeightSource, limits: &StagingLimits) -> 
                 && parts[0] != MANIFEST_NAME,
             "unsafe or reserved manifest path"
         );
+        let path = PathBuf::from(&shard.path);
         ensure!(
-            paths.insert(PathBuf::from(&shard.path)),
-            "duplicate manifest path"
+            manifest.entries.insert(path.clone(), false).is_none(),
+            "duplicate or overlapping manifest path"
         );
+        for parent in path
+            .ancestors()
+            .skip(1)
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            ensure!(
+                *manifest.entries.entry(parent.to_owned()).or_insert(true),
+                "file and directory paths overlap"
+            );
+        }
         validate_sha(&shard.sha256)?;
         checked_url(&shard.url, limits)?;
         total = total
             .checked_add(shard.size_bytes)
             .context("manifest size overflow")?;
-        ensure!(
-            total <= source.size_bytes,
-            "manifest total exceeds pinned model size"
-        );
     }
     ensure!(
         total == source.size_bytes,
         "manifest total differs from pinned model size"
     );
-    for path in &paths {
-        let mut parent = path.parent();
-        while let Some(directory) = parent {
-            ensure!(
-                !paths.contains(directory),
-                "file and directory paths overlap"
-            );
-            parent = directory.parent();
+    Ok(manifest)
+}
+
+fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let source = CString::new(source.as_os_str().as_bytes())?;
+        let destination = CString::new(destination.as_os_str().as_bytes())?;
+        // Both C strings outlive the call; exclusive rename preserves any winner.
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().into())
         }
     }
-    Ok(manifest)
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    bail!("atomic no-replace weight publication requires Linux or macOS")
 }
 
 fn checked_url(value: &str, limits: &StagingLimits) -> Result<Url> {
@@ -303,9 +332,7 @@ async fn download_shard(
     }
     ensure!(size == shard.size_bytes, "shard size mismatch");
     ensure!(
-        shard
-            .sha256
-            .eq_ignore_ascii_case(&format!("{:x}", digest.finalize())),
+        digest_matches(&shard.sha256, digest.finalize()),
         "shard digest mismatch"
     );
     file.sync_all().await?;
@@ -322,10 +349,6 @@ async fn verify_cache(
         "cache directory is not a regular directory"
     );
     let raw_file = open_regular(&directory.join(MANIFEST_NAME))?;
-    ensure!(
-        raw_file.metadata()?.len() <= limits.max_manifest_bytes as u64,
-        "cached manifest exceeds size limit"
-    );
     let mut raw = Vec::new();
     tokio::fs::File::from_std(raw_file)
         .take(
@@ -340,18 +363,7 @@ async fn verify_cache(
         "cached manifest exceeds size limit"
     );
     let manifest = parse_manifest(&raw, source, limits)?;
-    let mut entries = BTreeMap::from([(PathBuf::from(MANIFEST_NAME), false)]);
-    for shard in &manifest.files {
-        let path = PathBuf::from(&shard.path);
-        entries.insert(path.clone(), false);
-        for parent in path
-            .ancestors()
-            .skip(1)
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            entries.insert(parent.to_owned(), true);
-        }
-    }
+    let mut entries = manifest.entries;
     let mut directories = vec![PathBuf::new()];
     while let Some(relative) = directories.pop() {
         for entry in fs::read_dir(directory.join(&relative))? {
@@ -395,10 +407,7 @@ async fn verify_cache(
             digest.update(&buffer[..count]);
         }
         ensure!(
-            size == shard.size_bytes
-                && shard
-                    .sha256
-                    .eq_ignore_ascii_case(&format!("{:x}", digest.finalize())),
+            size == shard.size_bytes && digest_matches(&shard.sha256, digest.finalize()),
             "cached shard digest mismatch"
         );
     }
@@ -411,18 +420,8 @@ fn prepare_directory(destination: &Path) -> Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(destination)
     };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                ensure!(normalized.pop(), "invalid cache destination");
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
     let mut prefix = PathBuf::new();
-    for component in normalized.components() {
+    for component in absolute.components() {
         prefix.push(component.as_os_str());
         match fs::symlink_metadata(&prefix) {
             Ok(metadata) => ensure!(
@@ -441,7 +440,7 @@ fn prepare_directory(destination: &Path) -> Result<PathBuf> {
             Err(error) => return Err(error).context("cannot inspect cache directory"),
         }
     }
-    Ok(normalized)
+    Ok(absolute)
 }
 
 fn private_directory(path: &Path, recursive: bool) -> std::io::Result<()> {
@@ -467,16 +466,12 @@ fn create_file(path: &Path) -> Result<fs::File> {
 }
 
 fn open_regular(path: &Path) -> Result<fs::File> {
-    ensure!(
-        fs::symlink_metadata(path)?.file_type().is_file(),
-        "model cache entry is not a regular file"
-    );
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
     ensure!(
