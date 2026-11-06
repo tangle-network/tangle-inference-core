@@ -90,7 +90,7 @@ p.add_argument("--port", type=int)
 p.add_argument("--host")
 a, _ = p.parse_known_args()
 with open(a.receipt, "w") as f:
-    json.dump({"args": sys.argv[2:], "token_in_env": os.environ.get("HF_TOKEN") == "test-only-token", "hopper_env": os.environ.get("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE")}, f)
+    json.dump({"args": sys.argv[2:], "token_in_env": os.environ.get("HF_TOKEN") == "test-only-token", "hopper_env": os.environ.get("SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE"), "catalog_marker": os.environ.get("SGLANG_TEST_CATALOG")}, f)
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/crash": os._exit(42)
@@ -105,7 +105,11 @@ http.server.HTTPServer((a.host, a.port), Handler).serve_forever()
 
 #[tokio::test]
 async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
-    for engine in [EngineKind::Sglang, EngineKind::Vllm] {
+    for (engine, fixture) in [
+        (EngineKind::Sglang, false),
+        (EngineKind::Vllm, false),
+        (EngineKind::Sglang, true),
+    ] {
         let dir = tempfile::tempdir()?;
         let (script, receipt) = child_script(dir.path())?;
         let mut cfg = config(engine);
@@ -120,6 +124,21 @@ async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
             dir.path().join("router.json").display()
         );
         cfg.download_dir = Some(dir.path().join("model cache"));
+        let catalog_path = dir.path().join("catalog.json");
+        if fixture {
+            let raw = include_str!("fixtures/qwen3-catalog.json");
+            assert_eq!(
+                RecipeCatalog::from_json(raw)?.image,
+                RecipeCatalog::bundled()?.image
+            );
+            std::fs::write(&catalog_path, raw)?;
+            let mut value = serde_json::to_value(cfg)?;
+            value["recipe_catalog"] = serde_json::json!(catalog_path);
+            value["base_family"] = "test-qwen3-0.6b".into();
+            value["model"] = "Qwen/Qwen3-0.6B".into();
+            value["tensor_parallel_size"] = 1.into();
+            cfg = serde_json::from_value(value)?;
+        }
         let model = cfg.model.clone();
         let process = Arc::new(EngineProcess::spawn(cfg).await?);
         process.wait_ready().await?;
@@ -149,12 +168,45 @@ async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
             dir.path().join("model cache").to_str().unwrap()
         );
         assert_eq!(receipt["token_in_env"], false);
-        if engine == EngineKind::Sglang {
+        if engine == EngineKind::Sglang && !fixture {
             assert_eq!(receipt["hopper_env"], "0");
         }
         assert!(!argv.iter().any(|arg| arg.contains("test-only-token")));
+        if fixture {
+            assert_eq!(option(&argv, "--tp"), "1");
+            assert_eq!(
+                option(&argv, "--revision"),
+                "c1899de289a04d12100db370d81485cdf75e47ca"
+            );
+            assert_eq!(option(&argv, "--served-model-name"), model);
+            assert_eq!(receipt["catalog_marker"], "initial");
+            let router: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("router.json"))?)?;
+            let router_args: Vec<String> = serde_json::from_value(router["args"].clone())?;
+            assert_eq!(option(&router_args, "--policy"), "cache_aware");
+            assert!(process
+                .client()
+                .get(format!("{}/health", option(&router_args, "--worker-urls")))
+                .send()
+                .await?
+                .status()
+                .is_success());
+            let mut changed: serde_json::Value =
+                serde_json::from_str(include_str!("fixtures/qwen3-catalog.json"))?;
+            changed["families"]["test-qwen3-0.6b"]["args"] =
+                serde_json::json!(["--served-model-name", "catalog-changed"]);
+            changed["families"]["test-qwen3-0.6b"]["env"]["SGLANG_TEST_CATALOG"] = "changed".into();
+            std::fs::write(&catalog_path, changed.to_string())?;
+        }
         process.restart().await?;
         assert!(process.is_healthy().await);
+        if fixture {
+            let restarted: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("argv.json"))?)?;
+            let args: Vec<String> = serde_json::from_value(restarted["args"].clone())?;
+            assert_eq!(option(&args, "--served-model-name"), model);
+            assert_eq!(restarted["catalog_marker"], "initial");
+        }
         process.shutdown().await;
         assert!(!process.is_healthy().await);
         process.shutdown().await;
