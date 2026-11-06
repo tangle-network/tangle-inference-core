@@ -1,6 +1,12 @@
+use crate::weights::{stage_weights, StagingLimits, WeightSource};
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
@@ -9,7 +15,8 @@ use tokio::{
 
 use crate::recipe::set_option;
 pub use crate::recipe::{
-    FamilyRecipe, GpuRecipe, RecipeArm, RecipeCatalog, ResolvedRecipe, ENGINE_PROFILES,
+    FamilyRecipe, GpuRecipe, RecipeArm, RecipeCatalog, ResolvedRecipe, ThroughputMeasurement,
+    ENGINE_PROFILES,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +25,16 @@ pub enum EngineKind {
     #[default]
     Vllm,
     Sglang,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineWeights {
+    pub manifest_url: String,
+    #[serde(flatten)]
+    pub source: WeightSource,
+    pub cache_dir: PathBuf,
+    #[serde(default)]
+    pub allow_loopback_http: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -39,6 +56,10 @@ pub struct EngineConfig {
     pub port: u16,
     #[serde(default = "default_parallelism")]
     pub tensor_parallel_size: u32,
+    #[serde(default = "default_parallelism")]
+    pub replicas: u32,
+    #[serde(default)]
+    pub router_command: String,
     #[serde(default)]
     pub extra_args: Vec<String>,
     /// Explicit executable plus initial arguments; never evaluated by a shell.
@@ -46,6 +67,8 @@ pub struct EngineConfig {
     pub command: String,
     #[serde(default)]
     pub download_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub weights: Option<EngineWeights>,
     #[serde(default = "default_timeout")]
     pub startup_timeout_secs: u64,
     #[serde(default)]
@@ -95,9 +118,12 @@ impl Default for EngineConfig {
             host: default_host(),
             port: default_port(),
             tensor_parallel_size: default_parallelism(),
+            replicas: 1,
+            router_command: String::new(),
             extra_args: Vec::new(),
             command: String::new(),
             download_dir: None,
+            weights: None,
             startup_timeout_secs: default_timeout(),
             external: false,
         }
@@ -110,7 +136,10 @@ impl EngineConfig {
             self.engine == EngineKind::Sglang,
             "family catalog contains SGLang recipes"
         );
-        let catalog = RecipeCatalog::bundled()?;
+        self.recipe_from(&RecipeCatalog::bundled()?)
+    }
+
+    fn recipe_from(&self, catalog: &RecipeCatalog) -> Result<ResolvedRecipe> {
         let family = self
             .base_family
             .as_deref()
@@ -133,6 +162,13 @@ impl EngineConfig {
 
     /// The returned vector includes the executable at index zero.
     pub fn argv(&self) -> Result<Vec<String>> {
+        let recipe = (self.engine == EngineKind::Sglang)
+            .then(|| self.recipe())
+            .transpose()?;
+        self.argv_with_recipe(recipe.as_ref())
+    }
+
+    fn argv_with_recipe(&self, recipe: Option<&ResolvedRecipe>) -> Result<Vec<String>> {
         ensure!(
             !self.model.is_empty() && !self.model.starts_with('-'),
             "invalid model id or path"
@@ -157,7 +193,7 @@ impl EngineConfig {
         ensure!(!command.is_empty(), "empty engine command");
         let mut args = match self.engine {
             EngineKind::Vllm => Vec::new(),
-            EngineKind::Sglang => self.recipe()?.args,
+            EngineKind::Sglang => recipe.context("SGLang recipe is missing")?.args.clone(),
         };
         args.extend(self.extra_args.iter().cloned());
         let (model_flag, context_flag, parallel_flag) = match self.engine {
@@ -199,6 +235,7 @@ impl EngineConfig {
 
 struct EngineChild {
     child: Child,
+    health_url: String,
     #[cfg(unix)]
     group: i32,
 }
@@ -233,9 +270,13 @@ impl Drop for EngineChild {
     }
 }
 
-/// Owns one local engine child, or connects to an externally managed endpoint.
+/// Owns a model replica set and its router, or connects to an external endpoint.
 pub struct EngineProcess {
-    child: Mutex<Option<EngineChild>>,
+    children: Mutex<Vec<EngineChild>>,
+    launch: Mutex<()>,
+    cancel_start: watch::Sender<u64>,
+    stopped: AtomicBool,
+    recipe: Option<ResolvedRecipe>,
     config: EngineConfig,
     client: reqwest::Client,
     managed: bool,
@@ -244,7 +285,11 @@ pub struct EngineProcess {
 impl EngineProcess {
     pub fn connect(config: EngineConfig) -> Result<Self> {
         Ok(Self {
-            child: Mutex::new(None),
+            children: Mutex::new(Vec::new()),
+            launch: Mutex::new(()),
+            cancel_start: watch::channel(0).0,
+            stopped: AtomicBool::new(false),
+            recipe: None,
             config,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(300))
@@ -254,14 +299,176 @@ impl EngineProcess {
     }
 
     pub async fn spawn(config: EngineConfig) -> Result<Self> {
+        Self::spawn_with_catalog(config, &RecipeCatalog::bundled()?).await
+    }
+
+    pub async fn spawn_with_catalog(config: EngineConfig, catalog: &RecipeCatalog) -> Result<Self> {
+        ensure!(config.replicas > 0, "replica count must be positive");
+        let recipe = (config.engine == EngineKind::Sglang)
+            .then(|| config.recipe_from(catalog))
+            .transpose()?;
+        if let Some(recipe) = &recipe {
+            ensure!(
+                config
+                    .tensor_parallel_size
+                    .checked_mul(config.replicas)
+                    .is_some_and(|count| count <= recipe.gpu.max_per_node),
+                "replica set exceeds SDK node capacity"
+            );
+        } else {
+            ensure!(config.replicas == 1, "replica routing requires SGLang");
+        }
         let mut process = Self::connect(config)?;
+        process.recipe = recipe;
         process.managed = true;
-        *process.child.lock().await = Some(process.spawn_child()?);
+        if process.config.weights.is_none() {
+            *process.children.lock().await = process.spawn_children(None)?;
+        }
         Ok(process)
     }
 
-    fn spawn_child(&self) -> Result<EngineChild> {
-        let argv = self.config.argv()?;
+    async fn ensure_started(&self) -> Result<()> {
+        let mut cancelled = self.cancel_start.subscribe();
+        let generation = *cancelled.borrow();
+        let _launch = self.launch.lock().await;
+        ensure!(
+            !self.stopped.load(Ordering::Acquire),
+            "serving engine has stopped"
+        );
+        if !self.children.lock().await.is_empty() {
+            return Ok(());
+        }
+        let verified = if let Some(weights) = &self.config.weights {
+            let limits = StagingLimits {
+                allow_loopback_http: weights.allow_loopback_http,
+                timeout: Duration::from_secs(self.config.startup_timeout_secs),
+                ..Default::default()
+            };
+            Some(tokio::select! {
+                result = stage_weights(&weights.manifest_url, &weights.source, &weights.cache_dir, &limits) => result?,
+                _ = cancelled.changed() => bail!("weight staging cancelled"),
+            })
+        } else {
+            None
+        };
+        let mut children = self.children.lock().await;
+        ensure!(
+            !self.stopped.load(Ordering::Acquire) && *cancelled.borrow() == generation,
+            "engine startup cancelled"
+        );
+        *children = self.spawn_children(verified.as_ref().map(|weights| weights.model_dir()))?;
+        Ok(())
+    }
+
+    fn spawn_children(&self, model_dir: Option<&Path>) -> Result<Vec<EngineChild>> {
+        let mut children = Vec::new();
+        let devices: Option<Vec<_>> = std::env::var("CUDA_VISIBLE_DEVICES")
+            .ok()
+            .map(|value| value.split(',').map(str::trim).map(str::to_owned).collect());
+        let count = (self.config.tensor_parallel_size as usize)
+            .checked_mul(self.config.replicas as usize)
+            .context("replica GPU count overflow")?;
+        if self.config.replicas > 1 {
+            ensure!(
+                devices
+                    .as_ref()
+                    .is_some_and(|devices| devices.len() >= count
+                        && devices.iter().all(|id| !id.is_empty() && id != "-1")
+                        && devices
+                            .iter()
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                            == devices.len()),
+                "replicas require a distinct CUDA_VISIBLE_DEVICES allocation"
+            );
+        }
+        let mut urls = Vec::new();
+        for replica in 0..self.config.replicas {
+            let mut config = self.config.clone();
+            if config.engine == EngineKind::Sglang {
+                config.host = "127.0.0.1".into();
+                config.port = u16::try_from(replica + 1)
+                    .ok()
+                    .and_then(|offset| config.port.checked_add(offset))
+                    .context("replica port range overflow")?;
+            }
+            urls.push(format!("http://127.0.0.1:{}", config.port));
+            let mut env = self
+                .recipe
+                .as_ref()
+                .map(|recipe| recipe.env.clone())
+                .unwrap_or_default();
+            if self.config.replicas > 1 {
+                let start = replica as usize * config.tensor_parallel_size as usize;
+                env.insert(
+                    "CUDA_VISIBLE_DEVICES".into(),
+                    devices.as_ref().unwrap()[start..start + config.tensor_parallel_size as usize]
+                        .join(","),
+                );
+            }
+            let mut argv = config.argv_with_recipe(self.recipe.as_ref())?;
+            if let Some(directory) = model_dir {
+                let flag = if config.engine == EngineKind::Sglang {
+                    "--model-path"
+                } else {
+                    "--model"
+                };
+                set_option(
+                    &mut argv,
+                    &["--model", "--model-path"],
+                    flag,
+                    directory.to_str().context("weights path is not UTF-8")?,
+                );
+                set_option(
+                    &mut argv,
+                    &["--served-model-name"],
+                    "--served-model-name",
+                    &self.config.model,
+                );
+            }
+            let endpoint = if config.engine == EngineKind::Sglang {
+                urls.last().unwrap().clone()
+            } else {
+                self.endpoint()
+            };
+            children.push(self.spawn_child(&argv, env, endpoint)?);
+        }
+        if self.config.engine == EngineKind::Sglang {
+            let mut argv: Vec<String> = if self.config.router_command.is_empty() {
+                vec![
+                    "python3".into(),
+                    "-m".into(),
+                    "sglang_router.launch_router".into(),
+                ]
+            } else {
+                self.config
+                    .router_command
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect()
+            };
+            ensure!(!argv.is_empty(), "empty router command");
+            argv.extend([
+                "--host".into(),
+                self.config.host.clone(),
+                "--port".into(),
+                self.config.port.to_string(),
+                "--policy".into(),
+                "cache_aware".into(),
+                "--worker-urls".into(),
+            ]);
+            argv.extend(urls);
+            children.push(self.spawn_child(&argv, Default::default(), self.endpoint())?);
+        }
+        Ok(children)
+    }
+
+    fn spawn_child(
+        &self,
+        argv: &[String],
+        env: std::collections::BTreeMap<String, String>,
+        endpoint: String,
+    ) -> Result<EngineChild> {
         let mut command = Command::new(&argv[0]);
         command
             .env_clear()
@@ -288,9 +495,7 @@ impl EngineProcess {
             .stderr(Stdio::piped());
         #[cfg(unix)]
         command.process_group(0);
-        if self.config.engine == EngineKind::Sglang {
-            command.envs(self.config.recipe()?.env);
-        }
+        command.envs(env);
         let mut child = command.spawn().context("failed to start serving engine")?;
         for (stream, pipe) in
             [
@@ -319,6 +524,7 @@ impl EngineProcess {
         }
         tracing::info!(pid = child.id(), engine = ?self.config.engine, "spawned serving engine");
         Ok(EngineChild {
+            health_url: format!("{endpoint}/health"),
             #[cfg(unix)]
             group: child.id().context("serving engine has no pid")? as i32,
             child,
@@ -344,32 +550,54 @@ impl EngineProcess {
     }
 
     pub async fn is_healthy(&self) -> bool {
-        if self.managed {
-            let mut guard = self.child.lock().await;
-            if !matches!(
-                guard.as_mut().map(|process| process.child.try_wait()),
-                Some(Ok(None))
-            ) {
+        let urls = if self.managed {
+            let mut children = self.children.lock().await;
+            if children.is_empty()
+                || children
+                    .iter_mut()
+                    .any(|process| !matches!(process.child.try_wait(), Ok(None)))
+            {
+                return false;
+            }
+            children
+                .iter()
+                .map(|child| child.health_url.clone())
+                .collect::<Vec<_>>()
+        } else {
+            vec![format!("{}/health", self.endpoint())]
+        };
+        let mut probes = tokio::task::JoinSet::new();
+        for url in urls {
+            let client = self.client.clone();
+            probes.spawn(async move {
+                matches!(client.get(url).timeout(Duration::from_secs(1)).send().await,
+                Ok(response) if response.status().is_success())
+            });
+        }
+        while let Some(result) = probes.join_next().await {
+            if !matches!(result, Ok(true)) {
                 return false;
             }
         }
-        matches!(self.client.get(format!("{}/health", self.endpoint())).timeout(Duration::from_secs(5)).send().await,
-            Ok(response) if response.status().is_success())
+        true
     }
 
     pub async fn wait_ready(&self) -> Result<()> {
+        let generation = *self.cancel_start.borrow();
         let result = tokio::time::timeout(
             Duration::from_secs(self.config.startup_timeout_secs),
             async {
+                if self.managed {
+                    self.ensure_started().await?;
+                }
                 loop {
-                    {
-                        let mut guard = self.child.lock().await;
-                        if let Some(child) = guard.as_mut() {
+                    if self.managed {
+                        let mut children = self.children.lock().await;
+                        ensure!(!children.is_empty(), "serving engine has stopped");
+                        for child in children.iter_mut() {
                             if let Some(status) = child.child.try_wait()? {
                                 bail!("serving engine exited during startup: {status}");
                             }
-                        } else if self.managed {
-                            bail!("serving engine has stopped");
                         }
                     }
                     if self.is_healthy().await {
@@ -382,27 +610,26 @@ impl EngineProcess {
         .await
         .context("serving engine startup timed out")
         .and_then(|result| result);
-        if result.is_err() && self.managed {
+        if result.is_err() && self.managed && *self.cancel_start.borrow() == generation {
             self.shutdown().await;
         }
         result
     }
 
     pub async fn shutdown(&self) {
-        if let Some(mut child) = self.child.lock().await.take() {
+        self.stopped.store(true, Ordering::Release);
+        self.cancel_start
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        let mut children = self.children.lock().await;
+        while let Some(mut child) = children.pop() {
             child.terminate().await;
         }
     }
 
     pub async fn restart(&self) -> Result<()> {
         ensure!(self.managed, "cannot restart an externally managed engine");
-        {
-            let mut guard = self.child.lock().await;
-            if let Some(mut child) = guard.take() {
-                child.terminate().await;
-            }
-            *guard = Some(self.spawn_child()?);
-        }
+        self.shutdown().await;
+        self.stopped.store(false, Ordering::Release);
         self.wait_ready().await
     }
 

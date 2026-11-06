@@ -3,16 +3,7 @@ use std::path::PathBuf;
 /// Maximum entries before the queue refuses new enqueues (prevents unbounded disk growth).
 const MAX_QUEUE_DEPTH: usize = 1000;
 
-/// Maximum retries per settlement before it's moved to the permanent failure log.
-const MAX_RETRY_COUNT: u32 = 10;
-
-/// Persistent queue of failed settlements for automatic retry.
-///
-/// Improvements over the original:
-/// - Bounded: rejects enqueue if depth > MAX_QUEUE_DEPTH
-/// - Retry-aware: tracks retry_count, marks permanently failed after MAX_RETRY_COUNT
-/// - Depth reporting: `depth()` for monitoring/alerting
-/// - Atomic write: writes to .tmp then renames
+/// Persistent failed settlements for operator recovery.
 pub struct SettlementRecoveryQueue {
     path: PathBuf,
 }
@@ -97,79 +88,5 @@ impl SettlementRecoveryQueue {
         if std::fs::write(&tmp, &content).is_ok() {
             let _ = std::fs::rename(&tmp, &self.path);
         }
-    }
-
-    /// Remove the queue file.
-    pub fn clear(&self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-
-    /// Process the queue: retry each entry with the given callback.
-    /// Entries that succeed are removed. Entries that fail get retry_count
-    /// incremented. Entries past MAX_RETRY_COUNT are logged and removed.
-    ///
-    /// Returns (succeeded, failed, permanently_failed).
-    pub async fn retry_all<F, Fut>(&self, retry_fn: F) -> (usize, usize, usize)
-    where
-        F: Fn(&FailedSettlement) -> Fut,
-        Fut: std::future::Future<Output = Result<(), anyhow::Error>>,
-    {
-        let entries = self.pending();
-        if entries.is_empty() {
-            return (0, 0, 0);
-        }
-
-        tracing::info!(depth = entries.len(), "retrying failed settlements");
-
-        let mut remaining = Vec::new();
-        let mut succeeded = 0usize;
-        let mut failed = 0usize;
-        let mut permanently_failed = 0usize;
-
-        for mut entry in entries {
-            if entry.retry_count >= MAX_RETRY_COUNT {
-                tracing::error!(
-                    commitment = %entry.commitment,
-                    nonce = entry.nonce,
-                    amount = %entry.amount,
-                    retries = entry.retry_count,
-                    "settlement permanently failed after {} retries — MANUAL RECOVERY REQUIRED",
-                    MAX_RETRY_COUNT
-                );
-                permanently_failed += 1;
-                continue; // drop from queue
-            }
-
-            match retry_fn(&entry).await {
-                Ok(()) => {
-                    tracing::info!(
-                        commitment = %entry.commitment,
-                        nonce = entry.nonce,
-                        retry = entry.retry_count,
-                        "settlement retry succeeded"
-                    );
-                    succeeded += 1;
-                }
-                Err(e) => {
-                    entry.retry_count += 1;
-                    entry.error = format!("{e}");
-                    entry.timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    tracing::warn!(
-                        commitment = %entry.commitment,
-                        retry = entry.retry_count,
-                        error = %e,
-                        "settlement retry failed"
-                    );
-                    remaining.push(entry);
-                    failed += 1;
-                }
-            }
-        }
-
-        self.rewrite(&remaining);
-        (succeeded, failed, permanently_failed)
     }
 }

@@ -79,22 +79,6 @@ pub static TOKENS_PER_SECOND: LazyLock<GaugeVec> = LazyLock::new(|| {
     g
 });
 
-pub static TIME_TO_FIRST_TOKEN: LazyLock<HistogramVec> = LazyLock::new(|| {
-    let h = HistogramVec::new(
-        HistogramOpts::new(
-            "tangle_operator_time_to_first_token_ms",
-            "Time from request start to first output token",
-        )
-        .buckets(vec![
-            10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
-        ]),
-        &["model"],
-    )
-    .expect("metric");
-    REGISTRY.register(Box::new(h.clone())).expect("register");
-    h
-});
-
 pub static ERROR_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let c = IntCounterVec::new(
         Opts::new("tangle_operator_errors_total", "Errors by type"),
@@ -103,58 +87,6 @@ pub static ERROR_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric");
     REGISTRY.register(Box::new(c.clone())).expect("register");
     c
-});
-
-pub static GPU_UTILIZATION: LazyLock<GaugeVec> = LazyLock::new(|| {
-    let g = GaugeVec::new(
-        Opts::new(
-            "tangle_operator_gpu_utilization_percent",
-            "GPU compute utilization (0-100)",
-        ),
-        &["gpu_index"],
-    )
-    .expect("metric");
-    REGISTRY.register(Box::new(g.clone())).expect("register");
-    g
-});
-
-pub static GPU_MEMORY_USED: LazyLock<GaugeVec> = LazyLock::new(|| {
-    let g = GaugeVec::new(
-        Opts::new(
-            "tangle_operator_gpu_memory_used_mib",
-            "GPU memory used in MiB",
-        ),
-        &["gpu_index"],
-    )
-    .expect("metric");
-    REGISTRY.register(Box::new(g.clone())).expect("register");
-    g
-});
-
-pub static GPU_MEMORY_TOTAL: LazyLock<GaugeVec> = LazyLock::new(|| {
-    let g = GaugeVec::new(
-        Opts::new(
-            "tangle_operator_gpu_memory_total_mib",
-            "GPU total memory in MiB",
-        ),
-        &["gpu_index"],
-    )
-    .expect("metric");
-    REGISTRY.register(Box::new(g.clone())).expect("register");
-    g
-});
-
-pub static GPU_TEMPERATURE: LazyLock<GaugeVec> = LazyLock::new(|| {
-    let g = GaugeVec::new(
-        Opts::new(
-            "tangle_operator_gpu_temperature_celsius",
-            "GPU temperature in Celsius",
-        ),
-        &["gpu_index"],
-    )
-    .expect("metric");
-    REGISTRY.register(Box::new(g.clone())).expect("register");
-    g
 });
 
 pub static HEARTBEATS_SENT: LazyLock<IntCounter> = LazyLock::new(|| {
@@ -179,26 +111,21 @@ pub static HEARTBEATS_FAILED: LazyLock<IntCounter> = LazyLock::new(|| {
 
 static TOTAL_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_ERROR: AtomicU64 = AtomicU64::new(0);
-static TOTAL_TIMEOUT: AtomicU64 = AtomicU64::new(0);
 static LATENCY_SUM_MS: AtomicU64 = AtomicU64::new(0);
 static LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
 static LATENCY_MAX_MS: AtomicU64 = AtomicU64::new(0);
 static TOKENS_GENERATED: AtomicU64 = AtomicU64::new(0);
 static TOKENS_PROMPTED: AtomicU64 = AtomicU64::new(0);
 static PEAK_CONCURRENT: AtomicU64 = AtomicU64::new(0);
-static TTFT_SUM_MS: AtomicU64 = AtomicU64::new(0);
-static TTFT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// RAII guard that tracks request lifecycle metrics. Create at request start,
-/// set tokens/success/timeout during processing, metrics recorded on drop.
+/// set tokens/success during processing, metrics recorded on drop.
 pub struct RequestGuard {
     model: String,
     start: Instant,
     prompt_tokens: u32,
     completion_tokens: u32,
-    ttft_ms: Option<u64>,
     success: bool,
-    timed_out: bool,
 }
 
 impl Default for RequestGuard {
@@ -223,9 +150,7 @@ impl RequestGuard {
             start: Instant::now(),
             prompt_tokens: 0,
             completion_tokens: 0,
-            ttft_ms: None,
             success: false,
-            timed_out: false,
         }
     }
 
@@ -253,14 +178,6 @@ impl Drop for RequestGuard {
         ACTIVE_REQUESTS.dec();
 
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
-
-        if self.timed_out {
-            REQUEST_COUNT
-                .with_label_values(&[&self.model, "timeout"])
-                .inc();
-            TOTAL_TIMEOUT.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
 
         let status = if self.success { "success" } else { "error" };
         REQUEST_COUNT
@@ -299,14 +216,6 @@ impl Drop for RequestGuard {
                 TOKENS_PER_SECOND.with_label_values(&[&self.model]).set(tps);
             }
         }
-
-        if let Some(ttft) = self.ttft_ms {
-            TIME_TO_FIRST_TOKEN
-                .with_label_values(&[&self.model])
-                .observe(ttft as f64);
-            TTFT_SUM_MS.fetch_add(ttft, Ordering::Relaxed);
-            TTFT_COUNT.fetch_add(1, Ordering::Relaxed);
-        }
     }
 }
 
@@ -324,8 +233,7 @@ pub fn gather() -> String {
 pub fn on_chain_metrics() -> Vec<(String, u64)> {
     let success = TOTAL_SUCCESS.load(Ordering::Relaxed);
     let error = TOTAL_ERROR.load(Ordering::Relaxed);
-    let timeout = TOTAL_TIMEOUT.load(Ordering::Relaxed);
-    let total = success + error + timeout;
+    let total = success + error;
     let latency_count = LATENCY_COUNT.load(Ordering::Relaxed);
     let latency_avg = if latency_count > 0 {
         LATENCY_SUM_MS
@@ -342,16 +250,7 @@ pub fn on_chain_metrics() -> Vec<(String, u64)> {
         10000
     };
     let error_rate_bps = if total > 0 {
-        ((error + timeout) * 10000).checked_div(total).unwrap_or(0)
-    } else {
-        0
-    };
-    let ttft_count = TTFT_COUNT.load(Ordering::Relaxed);
-    let ttft_avg = if ttft_count > 0 {
-        TTFT_SUM_MS
-            .load(Ordering::Relaxed)
-            .checked_div(ttft_count)
-            .unwrap_or(0)
+        (error * 10000).checked_div(total).unwrap_or(0)
     } else {
         0
     };
@@ -361,7 +260,6 @@ pub fn on_chain_metrics() -> Vec<(String, u64)> {
         ("requests_total".into(), total),
         ("requests_success".into(), success),
         ("requests_error".into(), error),
-        ("requests_timeout".into(), timeout),
         ("latency_avg_ms".into(), latency_avg),
         ("latency_max_ms".into(), latency_max),
         ("uptime_bps".into(), uptime_bps),
@@ -374,7 +272,6 @@ pub fn on_chain_metrics() -> Vec<(String, u64)> {
             "tokens_prompted".into(),
             TOKENS_PROMPTED.load(Ordering::Relaxed),
         ),
-        ("ttft_avg_ms".into(), ttft_avg),
         (
             "peak_concurrent".into(),
             PEAK_CONCURRENT.load(Ordering::Relaxed),
@@ -387,10 +284,8 @@ pub fn on_chain_metrics() -> Vec<(String, u64)> {
 pub fn health_summary() -> serde_json::Value {
     let success = TOTAL_SUCCESS.load(Ordering::Relaxed);
     let error = TOTAL_ERROR.load(Ordering::Relaxed);
-    let timeout = TOTAL_TIMEOUT.load(Ordering::Relaxed);
-    let total = success + error + timeout;
+    let total = success + error;
     let latency_count = LATENCY_COUNT.load(Ordering::Relaxed);
-    let ttft_count = TTFT_COUNT.load(Ordering::Relaxed);
 
     serde_json::json!({
         "uptime_seconds": STARTED_AT.elapsed().as_secs(),
@@ -398,7 +293,6 @@ pub fn health_summary() -> serde_json::Value {
             "total": total,
             "success": success,
             "error": error,
-            "timeout": timeout,
         },
         "latency": {
             "avg_ms": if latency_count > 0 {
@@ -410,14 +304,7 @@ pub fn health_summary() -> serde_json::Value {
                 0
             },
             "max_ms": LATENCY_MAX_MS.load(Ordering::Relaxed),
-            "ttft_avg_ms": if ttft_count > 0 {
-                TTFT_SUM_MS
-                    .load(Ordering::Relaxed)
-                    .checked_div(ttft_count)
-                    .unwrap_or(0)
-            } else {
-                0
-            },
+
         },
         "throughput": {
             "tokens_generated": TOKENS_GENERATED.load(Ordering::Relaxed),

@@ -43,13 +43,6 @@ impl PaymentProof {
     }
 }
 
-/// Result of payment authorization.
-#[derive(Debug, Clone)]
-pub struct AuthorizationResult {
-    pub authorized_amount: u64,
-    pub proof: PaymentProof,
-}
-
 /// Trait for payment providers. Blueprints depend on this, not on a specific
 /// payment mechanism.
 #[async_trait]

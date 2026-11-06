@@ -9,7 +9,7 @@ use alloy::{
     sol_types::SolValue,
 };
 
-use crate::config::{default_claim_max_retries, BillingConfig, TangleConfig};
+use crate::config::{BillingConfig, TangleConfig};
 use crate::server::SpendAuthPayload;
 
 /// Trait for computing request cost. Blueprints implement this to define
@@ -165,38 +165,8 @@ pub struct BillingClient {
 }
 
 impl BillingClient {
-    /// Construct a `BillingClient` from individual parameters. This is the
-    /// preferred constructor for blueprints that don't use the
-    /// [`crate::config::TangleConfig`] / [`crate::config::BillingConfig`]
-    /// structs.
-    pub fn new_with_params(
-        rpc_url: String,
-        operator_key_hex: String,
-        shielded_credits_address: Address,
-        service_id: u64,
-        max_gas_price_gwei: u64,
-    ) -> anyhow::Result<Self> {
-        Self::new_with_params_full(
-            rpc_url,
-            operator_key_hex,
-            shielded_credits_address,
-            service_id,
-            max_gas_price_gwei,
-            default_claim_max_retries(),
-        )
-    }
-
-    /// Same as [`Self::new_with_params`] but lets the caller override
-    /// `claim_max_retries`.
-    pub fn new_with_params_full(
-        rpc_url: String,
-        operator_key_hex: String,
-        shielded_credits_address: Address,
-        service_id: u64,
-        max_gas_price_gwei: u64,
-        claim_max_retries: u32,
-    ) -> anyhow::Result<Self> {
-        let signer: PrivateKeySigner = operator_key_hex.parse()?;
+    pub fn new(tangle: &TangleConfig, billing: &BillingConfig) -> anyhow::Result<Self> {
+        let signer: PrivateKeySigner = tangle.operator_key.parse()?;
         let operator_address = signer.address();
 
         if std::env::var("PRODUCTION").unwrap_or_default() == "1" {
@@ -212,30 +182,17 @@ impl BillingClient {
         );
 
         let wallet = EthereumWallet::from(signer);
-        let rpc_url: reqwest::Url = rpc_url.parse()?;
+        let rpc_url: reqwest::Url = tangle.rpc_url.parse()?;
 
         Ok(Self {
-            claim_max_retries,
-            max_gas_price_gwei,
-            service_id,
+            claim_max_retries: billing.claim_max_retries,
+            max_gas_price_gwei: billing.max_gas_price_gwei,
+            service_id: tangle.service_id.unwrap_or(0),
             wallet,
-            shielded_credits: shielded_credits_address,
+            shielded_credits: tangle.shielded_credits.parse()?,
             rpc_url,
             operator_address,
         })
-    }
-
-    /// Convenience constructor that pulls fields from full config structs.
-    pub fn new(tangle: &TangleConfig, billing: &BillingConfig) -> anyhow::Result<Self> {
-        let shielded_credits: Address = tangle.shielded_credits.parse()?;
-        Self::new_with_params_full(
-            tangle.rpc_url.clone(),
-            tangle.operator_key.clone(),
-            shielded_credits,
-            tangle.service_id.unwrap_or(0),
-            billing.max_gas_price_gwei,
-            billing.claim_max_retries,
-        )
     }
 
     /// Returns the configured service_id this client claims payments for.
@@ -479,32 +436,6 @@ impl BillingClient {
     }
 }
 
-/// Verify a SpendAuth EIP-712 signature matches the expected spending key.
-///
-/// Returns Ok(recovered_address) if valid and matching, Err with reason otherwise.
-pub fn verify_spend_auth_signature(
-    auth: &SpendAuthPayload,
-    expected_spending_key: Address,
-    shielded_credits_addr: &str,
-    chain_id: u64,
-    clock_skew_tolerance_secs: u64,
-) -> Result<Address, String> {
-    let recovered = recover_spend_auth_signer(
-        auth,
-        shielded_credits_addr,
-        chain_id,
-        clock_skew_tolerance_secs,
-    )?;
-
-    if recovered != expected_spending_key {
-        return Err(format!(
-            "recovered signer ({recovered}) does not match expected spending key ({expected_spending_key})"
-        ));
-    }
-
-    Ok(recovered)
-}
-
 /// Recover the signer address from a SpendAuth EIP-712 signature.
 ///
 /// The caller MUST compare the returned address against the account's on-chain
@@ -562,8 +493,7 @@ pub fn recover_spend_auth_signer(
     Ok(recovered_address)
 }
 
-/// EIP-712 hashes shared by verification and the stdin-only signing CLI.
-pub fn spend_auth_hashes(
+fn spend_auth_hashes(
     auth: &SpendAuthPayload,
     shielded_credits_addr: &str,
     chain_id: u64,

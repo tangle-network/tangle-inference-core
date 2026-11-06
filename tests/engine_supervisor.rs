@@ -114,6 +114,11 @@ async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
             cfg.model = "acme/derived-deepseek".into();
         }
         cfg.command = format!("python3 {} {}", script.display(), receipt.display());
+        cfg.router_command = format!(
+            "python3 {} {}",
+            script.display(),
+            dir.path().join("router.json").display()
+        );
         cfg.download_dir = Some(dir.path().join("model cache"));
         let model = cfg.model.clone();
         let process = Arc::new(EngineProcess::spawn(cfg).await?);
@@ -182,6 +187,7 @@ async fn startup_failure_is_bounded_and_external_restart_is_refused() -> anyhow:
     std::fs::write(&script, "raise SystemExit(17)\n")?;
     let mut cfg = config(EngineKind::Sglang);
     cfg.command = format!("python3 {}", script.display());
+    cfg.router_command = cfg.command.clone();
     let process = EngineProcess::spawn(cfg.clone()).await?;
     let failure = tokio::time::timeout(Duration::from_secs(3), process.wait_ready()).await?;
     assert!(failure.unwrap_err().to_string().contains("17"));

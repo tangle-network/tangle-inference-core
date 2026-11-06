@@ -1,4 +1,5 @@
 use anyhow::{ensure, Context, Result};
+use blueprint_core::gpu::GpuClass;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -92,7 +93,7 @@ pub struct ResolvedRecipe {
     pub image: String,
     pub family: String,
     pub arm: String,
-    pub gpu_class: Option<String>,
+    pub gpu: GpuClass,
     pub env: BTreeMap<String, String>,
     pub model: String,
     pub revision: Option<String>,
@@ -128,6 +129,7 @@ impl RecipeCatalog {
             ensure!(
                 row.replicas > 0 && row.concurrency > 0
                     && row.tp.checked_mul(row.replicas).is_some_and(|n| n <= row.allocated_gpu_count)
+                    && row.allocated_gpu_count <= plan.gpu.max_per_node
                     && row.output_tokens_per_second().is_some(),
                 "measurement requires a positive, fully allocated serving topology and raw counters"
             );
@@ -173,12 +175,18 @@ impl RecipeCatalog {
             .get(arm)
             .with_context(|| format!("unknown quantization arm: {arm}"))?;
         let gpu_class = gpu_class.context("gpu_class requires an exact SDK catalog id")?;
-        let gpu = selected
+        let gpu = blueprint_core::gpu::find(gpu_class)
+            .with_context(|| format!("unknown SDK GPU class: {gpu_class}"))?;
+        ensure!(
+            parallelism <= gpu.max_per_node,
+            "tensor parallelism exceeds SDK node capacity"
+        );
+        let class_recipe = selected
             .classes
             .get(gpu_class)
             .with_context(|| format!("unsupported GPU class for {family}/{arm}: {gpu_class}"))?;
         ensure!(
-            gpu.tp.contains(&parallelism),
+            class_recipe.tp.contains(&parallelism),
             "unsupported tensor parallelism for {family}/{arm}/{gpu_class}"
         );
         let parent = selected
@@ -207,12 +215,12 @@ impl RecipeCatalog {
                 .args
                 .iter()
                 .chain(&selected.args)
-                .chain(&gpu.args)
+                .chain(&class_recipe.args)
                 .cloned(),
         );
         let mut env = recipe.env.clone();
         env.extend(selected.env.clone());
-        env.extend(gpu.env.clone());
+        env.extend(class_recipe.env.clone());
         for value in args.iter_mut().chain(env.values_mut()) {
             *value = value.replace("{tp}", &parallelism.to_string());
             ensure!(
@@ -239,7 +247,7 @@ impl RecipeCatalog {
             image: self.image.clone(),
             family: family.into(),
             arm: arm.into(),
-            gpu_class: Some(gpu_class.into()),
+            gpu,
             env,
             model: model.into(),
             revision,

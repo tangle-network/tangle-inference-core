@@ -156,10 +156,7 @@ async fn reject(
     limits: &StagingLimits,
 ) {
     let result = stage_weights(url, source, destination, limits).await;
-    assert!(
-        result.is_err(),
-        "staging unexpectedly succeeded: {result:?}"
-    );
+    let _ = result.expect_err("staging unexpectedly succeeded");
 }
 
 #[tokio::test]
@@ -287,7 +284,11 @@ async fn invalid_shards_prevent_staging_and_engine_child_start() {
         assert_empty(destination.path());
         let refused = match EngineProcess::spawn(config.clone()).await {
             Err(_) => true,
-            Ok(process) => { let _ = process.wait_ready().await; process.shutdown().await; false }
+            Ok(process) => {
+                let refused = process.wait_ready().await.is_err();
+                process.shutdown().await;
+                refused
+            }
         };
         assert!(!marker.exists(), "invalid shard reached the engine child process");
         assert!(refused, "invalid shard did not prevent engine startup");
@@ -347,9 +348,7 @@ async fn cache_and_destination_symlinks_are_never_followed() {
     reject(&url, &source, destination.path(), &fixture_limits()).await;
     let alias = destination.path().join("alias");
     std::os::unix::fs::symlink(outside.path(), &alias).unwrap();
-    assert!(stage_weights(&url, &source, &alias, &fixture_limits())
-        .await
-        .is_err());
+    reject(&url, &source, &alias, &fixture_limits()).await;
     assert!(origin.take_requests().is_empty());
     assert_eq!(std::fs::read(outside_file).unwrap(), b"hello");
 }

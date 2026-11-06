@@ -23,9 +23,8 @@ pub mod state;
 // Re-exports — gated by feature
 #[cfg(feature = "billing")]
 pub use billing::{
-    recover_spend_auth_signer, verify_spend_auth_signature, BillingClient, CostModel, CostParams,
-    FlatRequestCostModel, PerCharCostModel, PerImageCostModel, PerSecondCostModel,
-    PerTokenCostModel, TaskTypeCostModel,
+    recover_spend_auth_signer, BillingClient, CostModel, CostParams, FlatRequestCostModel,
+    PerCharCostModel, PerImageCostModel, PerSecondCostModel, PerTokenCostModel, TaskTypeCostModel,
 };
 #[cfg(feature = "metrics")]
 pub use metrics::{gather, health_summary, on_chain_metrics, RequestGuard};
@@ -38,8 +37,8 @@ pub use payment::{
 pub use server::{
     acquire_permit, billing_gate, error_response, extract_x402_spend_auth, gpu_health_handler,
     metrics_handler, payment_required, plan_settlement, settle_billing,
-    settle_billing_with_recovery, validate_spend_auth, AccountGuard, AppState,
-    AppStateBuilder, ErrorDetail, ErrorResponse, NonceStore, SettlementPlan, SpendAuthPayload,
+    settle_billing_with_recovery, validate_spend_auth, AccountGuard, AppState, AppStateBuilder,
+    ErrorDetail, ErrorResponse, NonceStore, SettlementPlan, SpendAuthPayload,
 };
 pub use settlement_queue::{FailedSettlement, SettlementRecoveryQueue};
 
