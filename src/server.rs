@@ -286,25 +286,6 @@ pub async fn validate_spend_auth(
         }
     }
 
-    // One lock spans check and insert so concurrent duplicates cannot both pass; it runs before signature checks (#18 item 5).
-    let nonce_key = (spend_auth.commitment.clone(), spend_auth.nonce);
-    if state
-        .nonce_store
-        .check_and_insert(
-            nonce_key,
-            spend_auth.expiry,
-            state.billing_config.clock_skew_tolerance_secs,
-        )
-        .await
-    {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "spend_auth nonce already used (replay detected)".to_string(),
-            "billing_error",
-            "nonce_replay",
-        ));
-    }
-
     // Recover signer
     let recovered_address = crate::billing::recover_spend_auth_signer(
         spend_auth,
@@ -356,6 +337,25 @@ pub async fn validate_spend_auth(
                 "account_check_failed",
             ));
         }
+    }
+
+    // Only a SpendAuth signed by the account's spending key may consume its nonce; one lock spans check and insert.
+    let nonce_key = (spend_auth.commitment.clone(), spend_auth.nonce);
+    if state
+        .nonce_store
+        .check_and_insert(
+            nonce_key,
+            spend_auth.expiry,
+            state.billing_config.clock_skew_tolerance_secs,
+        )
+        .await
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "spend_auth nonce already used (replay detected)".to_string(),
+            "billing_error",
+            "nonce_replay",
+        ));
     }
 
     Ok(requested_amount)
