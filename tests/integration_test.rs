@@ -20,6 +20,9 @@ use tangle_inference_core::{
 
 const TEST_OPERATOR_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const CALLER_KEY: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+/// Anvil's third dev account: a second operator on the same host.
+const SECOND_OPERATOR_KEY: &str =
+    "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 // Minimal ERC-20 compiled from tests/TestERC20.sol with solc 0.8.26 --optimize --metadata-hash none
 sol! {
     #[sol(rpc, bytecode = "6080604052348015600e575f80fd5b506105268061001c5f395ff3fe608060405234801561000f575f80fd5b5060043610610060575f3560e01c8063095ea7b31461006457806323b872dd1461008c57806340c10f191461009f57806370a08231146100b4578063a9059cbb146100e1578063dd62ed3e146100f4575b5f80fd5b61007761007236600461042c565b61011e565b60405190151581526020015b60405180910390f35b61007761009a366004610454565b61014b565b6100b26100ad36600461042c565b6102bc565b005b6100d36100c236600461048e565b5f6020819052908152604090205481565b604051908152602001610083565b6100776100ef36600461042c565b61032c565b6100d36101023660046104ae565b600160209081525f928352604080842090915290825290205481565b335f9081526001602081815260408084206001600160a01b03871685529091529091208290555b92915050565b6001600160a01b0383165f90815260208190526040812054821180159061019457506001600160a01b0384165f9081526001602090815260408083203384529091529020548211155b6101d45760405162461bcd60e51b815260206004820152600c60248201526b1a5b9cdd59999a58da595b9d60a21b60448201526064015b60405180910390fd5b6001600160a01b0384165f908152600160209081526040808320338452909152812080548492906102069084906104f3565b90915550506001600160a01b0384165f90815260208190526040812080548492906102329084906104f3565b90915550506001600160a01b0383165f908152602081905260408120805484929061025e908490610506565b92505081905550826001600160a01b0316846001600160a01b03167fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef846040516102aa91815260200190565b60405180910390a35060019392505050565b6001600160a01b0382165f90815260208190526040812080548392906102e3908490610506565b90915550506040518181526001600160a01b038316905f907fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef9060200160405180910390a35050565b335f908152602081905260408120548211156103795760405162461bcd60e51b815260206004820152600c60248201526b1a5b9cdd59999a58da595b9d60a21b60448201526064016101cb565b335f90815260208190526040812080548492906103979084906104f3565b90915550506001600160a01b0383165f90815260208190526040812080548492906103c3908490610506565b90915550506040518281526001600160a01b0384169033907fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef9060200160405180910390a350600192915050565b80356001600160a01b0381168114610427575f80fd5b919050565b5f806040838503121561043d575f80fd5b61044683610411565b946020939093013593505050565b5f805f60608486031215610466575f80fd5b61046f84610411565b925061047d60208501610411565b929592945050506040919091013590565b5f6020828403121561049e575f80fd5b6104a782610411565b9392505050565b5f80604083850312156104bf575f80fd5b6104c883610411565b91506104d660208401610411565b90509250929050565b634e487b7160e01b5f52601160045260245ffd5b81810381811115610145576101456104df565b80820180821115610145576101456104df56fea164736f6c634300081a000a")]
@@ -202,12 +205,14 @@ struct Account {
     key: PrivateKeySigner,
 }
 
+#[derive(Clone)]
 struct Shielded {
     rpc: String,
     chain_id: u64,
     credits: Address,
     token: Address,
     operator: Address,
+    operator_key: String,
 }
 
 /// Deploy ShieldedCredits and a test token, and fund `count` credit accounts with FUNDED each.
@@ -274,6 +279,7 @@ async fn deploy_shielded(rpc: String, count: u8) -> anyhow::Result<(Shielded, Ve
         credits,
         token,
         operator: operator_address,
+        operator_key: TEST_OPERATOR_KEY.into(),
     };
     Ok((chain, accounts))
 }
@@ -326,7 +332,7 @@ impl Shielded {
         let tangle = TangleConfig {
             rpc_url: self.rpc.clone(),
             chain_id: self.chain_id,
-            operator_key: TEST_OPERATOR_KEY.into(),
+            operator_key: self.operator_key.clone(),
             shielded_credits: format!("{:#x}", self.credits),
             blueprint_id: 0,
             service_id: Some(SERVICE_ID),
@@ -359,6 +365,22 @@ impl Shielded {
             .await
             .unwrap();
         (view.balance.to(), view.nonce.to())
+    }
+
+    /// The operator's journal: the configured path keyed by service and operator.
+    fn journal(&self, configured: &std::path::Path) -> std::path::PathBuf {
+        configured.with_extension(format!("{SERVICE_ID}.{:#x}.jsonl", self.operator))
+    }
+
+    /// Payment token the operator has been paid.
+    async fn operator_paid(&self) -> u64 {
+        let provider = ProviderBuilder::new().connect_http(self.rpc.parse().unwrap());
+        let paid = TestToken::new(self.token, provider)
+            .balanceOf(self.operator)
+            .call()
+            .await
+            .unwrap();
+        paid.to::<u64>()
     }
 }
 
@@ -533,13 +555,14 @@ fn killed_operator_settles_each_served_request_once_after_restart_on_anvil() -> 
     let anvil = AnvilInstance::spawn();
     let rpc = anvil.rpc_url();
     let dir = tempfile::tempdir()?;
-    let journal = dir.path().join("data/settlements.jsonl");
+    let configured = dir.path().join("data/settlements.jsonl");
     let config = serde_json::json!({
-        "settlement_journal_path": journal,
+        "settlement_journal_path": configured,
         "max_gas_price_gwei": 100,
     });
     let main = tokio::runtime::Runtime::new()?;
     let (chain, accounts) = main.block_on(deploy_shielded(rpc.clone(), 1))?;
+    let journal = chain.journal(&configured);
     let account = &accounts[0];
     let costs = [100u64, 150, 200, 250];
 
@@ -579,20 +602,10 @@ fn killed_operator_settles_each_served_request_once_after_restart_on_anvil() -> 
     // Cancel every task without draining it; the wait only lets the dropped journal unlock.
     operator.shutdown_timeout(Duration::from_secs(10));
     let served: u64 = costs.iter().sum();
-    let (url, token, operator) = (rpc.as_str(), chain.token, chain.operator);
-    let operator_paid = move || async move {
-        let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
-        let paid = TestToken::new(token, provider)
-            .balanceOf(operator)
-            .call()
-            .await
-            .unwrap();
-        paid.to::<u64>()
-    };
     main.block_on(async {
         // Only the first settlement landed; the other three still lock their 300 pre-auths.
         assert_eq!(owed_in(&journal), 3);
-        assert_eq!(operator_paid().await, costs[0]);
+        assert_eq!(chain.operator_paid().await, costs[0]);
         assert_eq!(chain.on_chain(account).await, (FUNDED - costs[0] - 900, 4));
         set_base_fee(&rpc, 1).await?;
 
@@ -601,7 +614,7 @@ fn killed_operator_settles_each_served_request_once_after_restart_on_anvil() -> 
         let restarted = chain.state(config.clone());
         restarted.drain_settlements().await;
         assert_eq!(owed_in(&journal), 0);
-        assert_eq!(operator_paid().await, served);
+        assert_eq!(chain.operator_paid().await, served);
         assert_eq!(chain.on_chain(account).await, (FUNDED - served, 4));
         drop(restarted);
 
@@ -610,8 +623,80 @@ fn killed_operator_settles_each_served_request_once_after_restart_on_anvil() -> 
         let replayed = chain.state(config.clone());
         replayed.drain_settlements().await;
         assert_eq!(owed_in(&journal), 0);
-        assert_eq!(operator_paid().await, served);
+        assert_eq!(chain.operator_paid().await, served);
         assert_eq!(chain.on_chain(account).await, (FUNDED - served, 4));
+        anyhow::Ok(())
+    })
+}
+
+#[test]
+fn operators_sharing_a_host_journal_and_settle_only_their_own_on_anvil() -> anyhow::Result<()> {
+    if std::env::var("ANVIL_E2E").as_deref() != Ok("1") {
+        eprintln!("set ANVIL_E2E=1 to run the chain journey");
+        return Ok(());
+    }
+    let anvil = AnvilInstance::spawn();
+    let rpc = anvil.rpc_url();
+    let dir = tempfile::tempdir()?;
+    // Both operators run the default relative path from one working directory.
+    let configured = dir.path().join("data/settlements.jsonl");
+    let config = serde_json::json!({
+        "settlement_journal_path": configured,
+        "max_gas_price_gwei": 100,
+    });
+    let main = tokio::runtime::Runtime::new()?;
+    let (first, accounts) = main.block_on(deploy_shielded(rpc.clone(), 2))?;
+    let second = Shielded {
+        operator: SECOND_OPERATOR_KEY.parse::<PrivateKeySigner>()?.address(),
+        operator_key: SECOND_OPERATOR_KEY.into(),
+        ..first.clone()
+    };
+    let operators = [(&first, &accounts[0], 120u64), (&second, &accounts[1], 170)];
+
+    // Each serves one request; a gas spike holds both settlements when both are killed.
+    let killed = tokio::runtime::Runtime::new()?;
+    killed.block_on(async {
+        let mut served = Vec::new();
+        for (chain, account, cost) in operators {
+            let state = chain.state(config.clone());
+            let proof = PaymentProof::SpendAuth(chain.sign(account, &account.key, 300, 0));
+            let authorized = authorize_request(&state, proof, 300, async { true })
+                .await
+                .map_err(|r| anyhow::anyhow!("{:#x} refused: {}", chain.operator, r.status()))?;
+            served.push((state, authorized, cost));
+        }
+        set_base_fee(&rpc, 1_000).await?;
+        for (state, authorized, cost) in served {
+            let settling = state.clone();
+            state.spawn_settlement(async move {
+                settle_request(&settling, &authorized, Some(cost)).await
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while operators
+            .iter()
+            .any(|(chain, _, _)| owed_in(&chain.journal(&configured)) < 1)
+        {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "both settlements must be journaled, each in its operator's own journal"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::Ok(())
+    })?;
+    killed.shutdown_timeout(Duration::from_secs(10));
+
+    // Restarted, each settles exactly its own entry and leaves nothing to retry.
+    main.block_on(async {
+        set_base_fee(&rpc, 1).await?;
+        for (chain, account, cost) in operators {
+            let restarted = chain.state(config.clone());
+            restarted.drain_settlements().await;
+            assert_eq!(owed_in(&chain.journal(&configured)), 0);
+            assert_eq!(chain.operator_paid().await, cost);
+            assert_eq!(chain.on_chain(account).await, (FUNDED - cost, 1));
+        }
         anyhow::Ok(())
     })
 }
