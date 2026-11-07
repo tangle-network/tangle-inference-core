@@ -158,8 +158,7 @@ pub struct BillingClient {
     claim_max_retries: u32,
     max_gas_price_gwei: u64,
     service_id: u64,
-    provider: DynProvider,
-    shielded_credits: Address,
+    credits: IShieldedCredits::IShieldedCreditsInstance<DynProvider>,
     operator_address: Address,
     journal: Option<std::sync::Arc<SettlementJournal>>,
 }
@@ -195,8 +194,7 @@ impl BillingClient {
             claim_max_retries: billing.claim_max_retries,
             max_gas_price_gwei: billing.max_gas_price_gwei,
             service_id: tangle.service_id.unwrap_or(0),
-            provider,
-            shielded_credits: tangle.shielded_credits.parse()?,
+            credits: IShieldedCredits::new(tangle.shielded_credits.parse()?, provider),
             operator_address,
             journal: match billing.settlement_journal_path.clone() {
                 Some(path) => SettlementJournal::open(path)?.map(std::sync::Arc::new),
@@ -241,10 +239,8 @@ impl BillingClient {
 
     /// Whether the authorization is on-chain and not yet claimed.
     async fn spend_open(&self, auth_hash: &str) -> anyhow::Result<bool> {
-        let spend = IShieldedCredits::new(self.shielded_credits, &self.provider)
-            .getSpendAuth(auth_hash.parse()?)
-            .call()
-            .await?;
+        let spend = self.credits.getSpendAuth(auth_hash.parse()?);
+        let spend = spend.call().await?;
         Ok(!spend.amount.is_zero() && !spend.claimed)
     }
 
@@ -302,7 +298,7 @@ impl BillingClient {
             return Ok(());
         }
 
-        let gas_price = self.provider.get_gas_price().await?;
+        let gas_price = self.credits.provider().get_gas_price().await?;
         let gas_price_gwei = gas_price / 1_000_000_000;
 
         if gas_price_gwei > max_gwei as u128 {
@@ -319,8 +315,7 @@ impl BillingClient {
         self.check_gas_price().await?;
 
         let auth = self.build_auth(spend_auth)?;
-        let contract = IShieldedCredits::new(self.shielded_credits, &self.provider);
-        let receipt = self.transact(contract.authorizeSpend(auth)).await?;
+        let receipt = self.transact(self.credits.authorizeSpend(auth)).await?;
         tracing::info!(
             tx_hash = %receipt.transaction_hash,
             "authorizeSpend confirmed"
@@ -415,12 +410,12 @@ impl BillingClient {
                 continue;
             }
 
-            let contract = IShieldedCredits::new(self.shielded_credits, &self.provider);
+            let credits = &self.credits;
             let confirmed = if *metered {
-                let settle = contract.settlePayment(auth_hash, operator, U256::from(*amount));
+                let settle = credits.settlePayment(auth_hash, operator, U256::from(*amount));
                 self.transact(settle).await
             } else {
-                let claim = contract.claimPayment(auth_hash, operator);
+                let claim = credits.claimPayment(auth_hash, operator);
                 self.transact(claim).await
             };
             match confirmed {
@@ -451,10 +446,8 @@ impl BillingClient {
 
     /// Return an unsettled authorization's full credit to its account; only its operator may.
     pub(crate) async fn release_payment(&self, auth: &SpendAuthPayload) -> anyhow::Result<()> {
-        let contract = IShieldedCredits::new(self.shielded_credits, &self.provider);
-        let receipt = self
-            .transact(contract.releasePayment(Self::auth_hash(auth)?))
-            .await?;
+        let release = self.credits.releasePayment(Self::auth_hash(auth)?);
+        let receipt = self.transact(release).await?;
         tracing::info!(tx_hash = %receipt.transaction_hash, "releasePayment confirmed");
         Ok(())
     }
@@ -473,8 +466,11 @@ impl BillingClient {
 
     pub async fn get_account_info(&self, commitment: &str) -> anyhow::Result<AccountInfo> {
         let commitment: B256 = commitment.parse()?;
-        let contract = IShieldedCredits::new(self.shielded_credits, &self.provider);
-        let result = contract.getAccount(FixedBytes(commitment.0)).call().await?;
+        let result = self
+            .credits
+            .getAccount(FixedBytes(commitment.0))
+            .call()
+            .await?;
         Ok(AccountInfo {
             spending_key: result.spendingKey,
             balance: result.balance,
