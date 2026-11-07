@@ -286,11 +286,7 @@ pub async fn validate_spend_auth(
         }
     }
 
-    // Atomic nonce check + insert — holds the write lock across both
-    // operations to prevent TOCTOU races where two concurrent requests
-    // with the same nonce could both pass a separate check before either
-    // inserts. If downstream validation fails, we've "wasted" a nonce,
-    // which is safe (the client can always generate a new one).
+    // One lock spans check and insert so concurrent duplicates cannot both pass; it runs before signature checks (#18 item 5).
     let nonce_key = (spend_auth.commitment.clone(), spend_auth.nonce);
     if state
         .nonce_store
@@ -451,7 +447,9 @@ pub async fn billing_gate(
 fn require_preauth_covers(state: &AppState, preauth: u64, max_cost: u64) -> Result<(), Response> {
     let floor = max_cost.max(state.billing_config.min_charge_amount);
     let (b, t) = (&state.billing_config, &state.tangle_config);
-    (preauth >= floor).then_some(()).ok_or_else(|| payment_required(b, t, state.operator_address, floor))
+    (preauth >= floor)
+        .then_some(())
+        .ok_or_else(|| payment_required(b, t, state.operator_address, floor))
 }
 
 /// Settle metered usage up to the pre-authorization, or claim it in full when usage is absent.
@@ -475,10 +473,7 @@ pub async fn settle_billing(
 
 // ─── Unified, rail-agnostic request billing ───────────────────────────────────
 //
-// One reusable orchestration so a blueprint's request handler never re-implements
-// per-rail billing: resolve a proof, authorize it (dispatched by rail), then
-// settle it. Shielded and direct differ only inside these functions; the handler
-// is identical for both.
+// Handlers resolve, authorize and settle through these rail-agnostic functions and never branch on the rail.
 
 /// A request's authorized payment, carried from the gate to settlement. Holds the
 /// per-account RAII guard so the in-flight count stays balanced across serving.

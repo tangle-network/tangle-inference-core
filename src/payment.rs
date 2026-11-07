@@ -491,7 +491,10 @@ pub fn create_provider(
 ) -> anyhow::Result<Box<dyn PaymentProvider>> {
     if rails.is_empty() {
         // Without a rail nothing verifies a proof, so required billing would accept any proof.
-        anyhow::ensure!(!billing.billing_required, "billing_required needs an enabled payment rail");
+        anyhow::ensure!(
+            !billing.billing_required,
+            "billing_required needs an enabled payment rail"
+        );
         Ok(Box::new(NoopProvider::new(tangle.operator_key.clone())?))
     } else {
         Ok(Box::new(PaymentRouter::build(rails, tangle, billing)?))
