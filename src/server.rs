@@ -592,7 +592,8 @@ pub async fn authorize_request(
             }
         }
         PaymentProof::DirectTransfer { .. } => {
-            if let Err(e) = state.payment_provider.authorize(&proof).await {
+            let required = estimated_max_cost.max(state.billing_config.min_charge_amount);
+            if let Err(e) = state.payment_provider.authorize(&proof, required).await {
                 return Err(error_response(
                     StatusCode::PAYMENT_REQUIRED,
                     format!("direct payment verification failed: {e}"),

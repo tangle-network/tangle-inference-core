@@ -101,6 +101,7 @@ async fn direct_transfer_authorization_and_rejections_on_anvil() -> anyhow::Resu
     for (destination, sent, claimed, expected_error) in [
         (recipient, 500_000u64, 500_000u64, None),
         (recipient, 100, 500, Some("less than requested")),
+        (recipient, 100, 100, Some("below the required")),
         (
             "0x000000000000000000000000000000000000dEaD".parse::<Address>()?,
             500,
@@ -122,16 +123,16 @@ async fn direct_transfer_authorization_and_rejections_on_anvil() -> anyhow::Resu
         };
         match expected_error {
             Some(message) => assert!(provider
-                .authorize(&proof)
+                .authorize(&proof, 400)
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains(message)),
             None => {
-                assert_eq!(provider.authorize(&proof).await?, claimed);
+                assert_eq!(provider.authorize(&proof, 400).await?, claimed);
                 provider.settle(&proof, 400_000).await?;
                 assert!(provider
-                    .authorize(&proof)
+                    .authorize(&proof, 400)
                     .await
                     .unwrap_err()
                     .to_string()
@@ -146,7 +147,7 @@ async fn direct_transfer_authorization_and_rejections_on_anvil() -> anyhow::Resu
         token: format!("{token_address:#x}"),
     };
     assert!(provider
-        .authorize(&missing)
+        .authorize(&missing, 0)
         .await
         .unwrap_err()
         .to_string()
