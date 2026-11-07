@@ -122,6 +122,7 @@ sol! {
         function authorizeSpend(SpendAuth calldata auth) external returns (bytes32 authHash);
         function claimPayment(bytes32 authHash, address recipient) external;
         function settlePayment(bytes32 authHash, address recipient, uint256 amount) external;
+        function releasePayment(bytes32 authHash) external;
         function getAccount(bytes32 commitment) external view returns (
             address spendingKey,
             address token,
@@ -378,6 +379,18 @@ impl BillingClient {
             max_retries
         );
         Err(err)
+    }
+
+    /// Return an unsettled authorization's full credit to its account; only its operator may.
+    pub async fn release_payment(&self, spend_auth: &SpendAuthPayload) -> anyhow::Result<()> {
+        let provider = ProviderBuilder::new()
+            .wallet(self.wallet.clone())
+            .connect_http(self.rpc_url.clone());
+        let contract = IShieldedCredits::new(self.shielded_credits, &provider);
+        let release = contract.releasePayment(Self::auth_hash(spend_auth)?);
+        let receipt = release.send().await?.get_receipt().await?;
+        tracing::info!(tx_hash = %receipt.transaction_hash, "releasePayment confirmed");
+        Ok(())
     }
 
     pub async fn get_account_info(&self, commitment: &str) -> anyhow::Result<AccountInfo> {
