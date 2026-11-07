@@ -453,16 +453,13 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     floor_gate
         .spawn_settlement(async move { settle_request(&settling, &authorized, Some(100)).await });
     floor_gate.drain_settlements().await;
-    let (balance, nonce) = chain.on_chain(&c).await;
-    assert!(
-        balance > FUNDED - 1000 && nonce == 1,
-        "drained settlement refunded nothing: {balance}"
-    );
+    // Settling 100 of the 1000 pre-authorized refunds the other 900.
+    assert_eq!(chain.on_chain(&c).await, (FUNDED - 100, 1));
     let over = PaymentProof::SpendAuth(chain.sign(&c, &c.key, 1001, 1));
     let (status, body) = refusal(authorize_request(&floor_gate, over, 100, healthy()).await).await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("\"excessive_preauth\""), "{body}");
-    assert_eq!(chain.on_chain(&c).await, (FUNDED - 1000, 1));
+    assert_eq!(chain.on_chain(&c).await, (FUNDED - 100, 1));
 
     // Rail disabled: a direct-only operator refuses a valid SpendAuth at both gates.
     let direct_only = chain.state(100, serde_json::json!({ "direct": true }), token);
