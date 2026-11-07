@@ -462,12 +462,12 @@ impl BillingClient {
     }
 
     /// Return an unsettled authorization's full credit to its account; only its operator may.
-    pub async fn release_payment(&self, spend_auth: &SpendAuthPayload) -> anyhow::Result<()> {
+    pub(crate) async fn release_payment(&self, auth: &SpendAuthPayload) -> anyhow::Result<()> {
         let provider = ProviderBuilder::new()
             .wallet(self.wallet.clone())
             .connect_http(self.rpc_url.clone());
         let contract = IShieldedCredits::new(self.shielded_credits, &provider);
-        let release = contract.releasePayment(Self::auth_hash(spend_auth)?);
+        let release = contract.releasePayment(Self::auth_hash(auth)?);
         let receipt = release.send().await?.get_receipt().await?;
         tracing::info!(tx_hash = %receipt.transaction_hash, "releasePayment confirmed");
         Ok(())

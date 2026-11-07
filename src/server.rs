@@ -403,55 +403,6 @@ pub fn acquire_permit(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePer
     })
 }
 
-/// Extract, validate and pre-authorize a SpendAuth; callers settle via [`settle_billing`], or
-/// release the credit with [`BillingClient::release_payment`] when they fail to serve.
-#[allow(clippy::result_large_err)]
-pub async fn billing_gate(
-    state: &AppState,
-    headers: &HeaderMap,
-    body_spend_auth: Option<SpendAuthPayload>,
-    estimated_cost: u64,
-) -> Result<(Option<SpendAuthPayload>, Option<u64>), Response> {
-    let spend_auth = body_spend_auth.or_else(|| extract_x402_spend_auth(headers));
-
-    if state.billing_config.billing_required && spend_auth.is_none() {
-        return Err(payment_required(
-            &state.billing_config,
-            &state.tangle_config,
-            state.operator_address,
-            estimated_cost.max(state.billing_config.min_charge_amount),
-        ));
-    }
-
-    let Some(spend_auth) = spend_auth else {
-        return Ok((None, None));
-    };
-
-    require_shielded_rail(state)?;
-    let preauth_amount = validate_spend_auth(state, &spend_auth).await?;
-    let proof = PaymentProof::SpendAuth(spend_auth.clone());
-    if let Err(response) = require_preauth_covers(state, preauth_amount, estimated_cost) {
-        return Err(refuse(state, &proof, response).await);
-    }
-
-    if let Err(e) = state.billing.authorize_spend(&spend_auth).await {
-        tracing::error!(error = %e, "authorizeSpend failed");
-        return Err(refuse(
-            state,
-            &proof,
-            error_response(
-                StatusCode::PAYMENT_REQUIRED,
-                format!("billing authorization failed: {e}"),
-                "billing_error",
-                "authorization_failed",
-            ),
-        )
-        .await);
-    }
-
-    Ok((Some(spend_auth), Some(preauth_amount)))
-}
-
 /// A refusal after validation frees the SpendAuth's nonce, which the contract requires on retry.
 async fn refuse(state: &AppState, proof: &PaymentProof, response: Response) -> Response {
     if let PaymentProof::SpendAuth(spend_auth) = proof {
@@ -486,7 +437,7 @@ fn require_preauth_covers(state: &AppState, preauth: u64, max_cost: u64) -> Resu
 }
 
 /// Settle metered usage up to the pre-authorization, or claim it in full when usage is absent.
-pub async fn settle_billing(
+async fn settle_billing(
     billing: &BillingClient,
     spend_auth: &SpendAuthPayload,
     preauth_amount: u64,
