@@ -483,6 +483,25 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     assert_eq!(status, 402, "{body}");
     assert!(body.contains("\"rail_disabled\""), "{body}");
     assert_eq!(chain.on_chain(&d).await, (FUNDED, 0));
+
+    // A never-mined authorizeSpend is a 402 after the receipt timeout, not a hung request.
+    let impatient = chain.state(serde_json::json!({ "receipt_timeout_secs": 2 }));
+    let rpc = ProviderBuilder::new().connect_http(chain.rpc.parse()?);
+    rpc.raw_request::<_, ()>("anvil_setAutomine".into(), (false,))
+        .await?;
+    let started = std::time::Instant::now();
+    let valid = PaymentProof::SpendAuth(chain.sign(&d, &d.key, 300, 0));
+    let (status, body) = refusal(authorize_request(&impatient, valid, 300, healthy()).await).await;
+    let waited = started.elapsed();
+    rpc.raw_request::<_, ()>("anvil_setAutomine".into(), (true,))
+        .await?;
+    assert_eq!(status, 402, "{body}");
+    assert!(body.contains("\"authorization_failed\""), "{body}");
+    assert!(waited < Duration::from_secs(5), "refused after {waited:?}");
+    // Mined late, the authorization locks its 300 with no operator holding it: expiry frees it.
+    rpc.raw_request::<_, serde_json::Value>("evm_mine".into(), ())
+        .await?;
+    assert_eq!(chain.on_chain(&d).await, (FUNDED - 300, 1));
     Ok(())
 }
 
