@@ -36,8 +36,8 @@ impl PaymentProof {
 /// Verifies payment before inference and settles according to the selected rail.
 #[async_trait]
 pub trait PaymentProvider: Send + Sync + 'static {
-    /// Returns the authorized amount in base token units.
-    async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64>;
+    /// Returns the authorized amount in base token units, refusing proofs below `required`.
+    async fn authorize(&self, proof: &PaymentProof, required: u64) -> anyhow::Result<u64>;
 
     /// Settles metered cost after serving; refund policy belongs to each rail.
     async fn settle(&self, proof: &PaymentProof, actual_cost: u64) -> anyhow::Result<()>;
@@ -63,7 +63,7 @@ impl ShieldedProvider {
 
 #[async_trait]
 impl PaymentProvider for ShieldedProvider {
-    async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
+    async fn authorize(&self, proof: &PaymentProof, _required: u64) -> anyhow::Result<u64> {
         let PaymentProof::SpendAuth(spend_auth) = proof else {
             anyhow::bail!(
                 "ShieldedProvider requires SpendAuth proof, got {:?}",
@@ -322,7 +322,7 @@ impl DirectProvider {
 
 #[async_trait]
 impl PaymentProvider for DirectProvider {
-    async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
+    async fn authorize(&self, proof: &PaymentProof, required: u64) -> anyhow::Result<u64> {
         let PaymentProof::DirectTransfer {
             tx_hash,
             from,
@@ -338,6 +338,11 @@ impl PaymentProvider for DirectProvider {
 
         self.replay.reserve(tx_hash).await?;
         match self.verify_transfer(tx_hash, from, amount).await {
+            // The verified transfer, not the client's claimed amount, must cover the request.
+            Ok(found_amount) if found_amount < required => {
+                self.replay.release(tx_hash).await;
+                anyhow::bail!("transfer of {found_amount} is below the required {required}")
+            }
             Ok(found_amount) => {
                 self.replay.commit(tx_hash).await;
                 tracing::info!(tx_hash, amount = found_amount, "direct payment verified");
@@ -376,7 +381,7 @@ impl NoopProvider {
 
 #[async_trait]
 impl PaymentProvider for NoopProvider {
-    async fn authorize(&self, _proof: &PaymentProof) -> anyhow::Result<u64> {
+    async fn authorize(&self, _proof: &PaymentProof, _required: u64) -> anyhow::Result<u64> {
         Ok(0)
     }
 
@@ -449,8 +454,8 @@ impl PaymentRouter {
 
 #[async_trait]
 impl PaymentProvider for PaymentRouter {
-    async fn authorize(&self, proof: &PaymentProof) -> anyhow::Result<u64> {
-        self.provider_for(proof)?.authorize(proof).await
+    async fn authorize(&self, proof: &PaymentProof, required: u64) -> anyhow::Result<u64> {
+        self.provider_for(proof)?.authorize(proof, required).await
     }
 
     async fn settle(&self, proof: &PaymentProof, actual_cost: u64) -> anyhow::Result<()> {
@@ -485,6 +490,11 @@ pub fn create_provider(
     billing: &BillingConfig,
 ) -> anyhow::Result<Box<dyn PaymentProvider>> {
     if rails.is_empty() {
+        // Without a rail nothing verifies a proof, so required billing would accept any proof.
+        anyhow::ensure!(
+            !billing.billing_required,
+            "billing_required needs an enabled payment rail"
+        );
         Ok(Box::new(NoopProvider::new(tangle.operator_key.clone())?))
     } else {
         Ok(Box::new(PaymentRouter::build(rails, tangle, billing)?))
