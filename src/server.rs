@@ -426,6 +426,7 @@ pub async fn billing_gate(
         return Ok((None, None));
     };
 
+    require_shielded_rail(state)?;
     let preauth_amount = validate_spend_auth(state, &spend_auth).await?;
     require_preauth_covers(state, preauth_amount, estimated_cost)?;
 
@@ -440,6 +441,20 @@ pub async fn billing_gate(
     }
 
     Ok((Some(spend_auth), Some(preauth_amount)))
+}
+
+/// A SpendAuth is a shielded-rail proof; an operator that disabled the rail must refuse it.
+#[allow(clippy::result_large_err)]
+fn require_shielded_rail(state: &AppState) -> Result<(), Response> {
+    if state.billing_config.payment_rails.shielded {
+        return Ok(());
+    }
+    Err(error_response(
+        StatusCode::PAYMENT_REQUIRED,
+        "shielded rail not enabled on this operator".into(),
+        "billing_error",
+        "rail_disabled",
+    ))
 }
 
 /// Settlement charges at most the pre-authorization, so it must cover the request's maximum cost.
@@ -549,14 +564,7 @@ pub async fn authorize_request(
     let preauth = match &proof {
         PaymentProof::SpendAuth(spend_auth) => {
             let preauth = validate_spend_auth(state, spend_auth).await?;
-            if !state.billing_config.payment_rails.shielded {
-                return Err(error_response(
-                    StatusCode::PAYMENT_REQUIRED,
-                    "shielded rail not enabled on this operator".into(),
-                    "billing_error",
-                    "rail_disabled",
-                ));
-            }
+            require_shielded_rail(state)?;
             let floor = require_preauth_covers(state, preauth, estimated_max_cost)?;
             // Cap locked credit at 1.5x the estimate, never below the floor; settlePayment refunds the rest.
             let ceiling = (estimated_max_cost.saturating_mul(3) / 2).max(floor);
