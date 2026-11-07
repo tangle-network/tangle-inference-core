@@ -169,6 +169,11 @@ pub struct BillingConfig {
     #[serde(default = "default_claim_max_retries")]
     pub claim_max_retries: u32,
 
+    /// Receipt wait per operator transaction, default 60 s: many blocks, yet bounded so a never-mined
+    /// authorizeSpend is a 402, a settlement a retried attempt, and a release or heartbeat a log line.
+    #[serde(default = "default_receipt_timeout_secs")]
+    pub receipt_timeout_secs: u64,
+
     #[serde(default = "default_clock_skew_tolerance")]
     pub clock_skew_tolerance_secs: u64,
 
@@ -242,6 +247,10 @@ fn default_max_line_buf_bytes() -> usize {
 
 pub(crate) fn default_claim_max_retries() -> u32 {
     3
+}
+
+pub(crate) fn default_receipt_timeout_secs() -> u64 {
+    60
 }
 
 fn default_clock_skew_tolerance() -> u64 {

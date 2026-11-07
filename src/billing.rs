@@ -152,10 +152,11 @@ pub struct AccountInfo {
 
 /// Serializes this process's operator transactions: the nonce filler reads the node's pending
 /// nonce, so each send must reach the pool before the next one reads it.
-pub(crate) static OPERATOR_SENDS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static OPERATOR_SENDS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub struct BillingClient {
     claim_max_retries: u32,
+    receipt_timeout: Duration,
     max_gas_price_gwei: u64,
     service_id: u64,
     credits: IShieldedCredits::IShieldedCreditsInstance<DynProvider>,
@@ -192,6 +193,7 @@ impl BillingClient {
 
         Ok(Self {
             claim_max_retries: billing.claim_max_retries,
+            receipt_timeout: Duration::from_secs(billing.receipt_timeout_secs),
             max_gas_price_gwei: billing.max_gas_price_gwei,
             service_id: tangle.service_id.unwrap_or(0),
             credits: IShieldedCredits::new(tangle.shielded_credits.parse()?, provider),
@@ -315,11 +317,8 @@ impl BillingClient {
         self.check_gas_price().await?;
 
         let auth = self.build_auth(spend_auth)?;
-        let receipt = self.transact(self.credits.authorizeSpend(auth)).await?;
-        tracing::info!(
-            tx_hash = %receipt.transaction_hash,
-            "authorizeSpend confirmed"
-        );
+        let receipt = transact(self.receipt_timeout, self.credits.authorizeSpend(auth)).await?;
+        tracing::info!(tx_hash = %receipt.transaction_hash, "authorizeSpend confirmed");
 
         Ok(())
     }
@@ -413,10 +412,10 @@ impl BillingClient {
             let credits = &self.credits;
             let confirmed = if *metered {
                 let settle = credits.settlePayment(auth_hash, operator, U256::from(*amount));
-                self.transact(settle).await
+                transact(self.receipt_timeout, settle).await
             } else {
                 let claim = credits.claimPayment(auth_hash, operator);
-                self.transact(claim).await
+                transact(self.receipt_timeout, claim).await
             };
             match confirmed {
                 Ok(receipt) => {
@@ -447,21 +446,9 @@ impl BillingClient {
     /// Return an unsettled authorization's full credit to its account; only its operator may.
     pub(crate) async fn release_payment(&self, auth: &SpendAuthPayload) -> anyhow::Result<()> {
         let release = self.credits.releasePayment(Self::auth_hash(auth)?);
-        let receipt = self.transact(release).await?;
+        let receipt = transact(self.receipt_timeout, release).await?;
         tracing::info!(tx_hash = %receipt.transaction_hash, "releasePayment confirmed");
         Ok(())
-    }
-
-    /// Send under [`OPERATOR_SENDS`], then wait for the receipt concurrently with other sends.
-    async fn transact<D: CallDecoder>(
-        &self,
-        call: CallBuilder<&DynProvider, D>,
-    ) -> anyhow::Result<TransactionReceipt> {
-        let pending = {
-            let _sending = OPERATOR_SENDS.lock().await;
-            call.send().await?
-        };
-        Ok(pending.get_receipt().await?)
     }
 
     pub async fn get_account_info(&self, commitment: &str) -> anyhow::Result<AccountInfo> {
@@ -476,6 +463,18 @@ impl BillingClient {
             balance: result.balance,
         })
     }
+}
+
+/// Send under [`OPERATOR_SENDS`], then wait up to `timeout` for the receipt beside other sends.
+pub(crate) async fn transact<P: Provider, D: CallDecoder>(
+    timeout: Duration,
+    call: CallBuilder<P, D>,
+) -> anyhow::Result<TransactionReceipt> {
+    let pending = {
+        let _sending = OPERATOR_SENDS.lock().await;
+        call.send().await?
+    };
+    Ok(pending.with_timeout(Some(timeout)).get_receipt().await?)
 }
 
 /// Recovers the EIP-712 SpendAuth signer and checks expiry with clock-skew tolerance.
