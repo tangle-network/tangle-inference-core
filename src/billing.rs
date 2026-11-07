@@ -1,9 +1,11 @@
 use std::time::Duration;
 
 use alloy::{
+    contract::{CallBuilder, CallDecoder},
     network::EthereumWallet,
     primitives::{keccak256, Address, FixedBytes, B256, U256},
-    providers::{Provider, ProviderBuilder},
+    providers::{DynProvider, Provider, ProviderBuilder},
+    rpc::types::TransactionReceipt,
     signers::local::PrivateKeySigner,
     sol,
     sol_types::SolValue,
@@ -148,13 +150,16 @@ pub struct AccountInfo {
     pub balance: U256,
 }
 
+/// Serializes this process's operator transactions: the nonce filler reads the node's pending
+/// nonce, so each send must reach the pool before the next one reads it.
+pub(crate) static OPERATOR_SENDS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub struct BillingClient {
     claim_max_retries: u32,
     max_gas_price_gwei: u64,
     service_id: u64,
-    wallet: EthereumWallet,
+    provider: DynProvider,
     shielded_credits: Address,
-    rpc_url: reqwest::Url,
     operator_address: Address,
     journal: Option<std::sync::Arc<SettlementJournal>>,
 }
@@ -176,16 +181,22 @@ impl BillingClient {
              use a KMS or encrypted keystore in production (set PRODUCTION=1 to enforce)"
         );
 
-        let wallet = EthereumWallet::from(signer);
-        let rpc_url: reqwest::Url = tangle.rpc_url.parse()?;
+        // Each send reads the pending nonce afresh, so a failed or dropped transaction leaves no gap.
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .with_gas_estimation()
+            .with_simple_nonce_management()
+            .fetch_chain_id()
+            .wallet(EthereumWallet::from(signer))
+            .connect_http(tangle.rpc_url.parse()?)
+            .erased();
 
         Ok(Self {
             claim_max_retries: billing.claim_max_retries,
             max_gas_price_gwei: billing.max_gas_price_gwei,
             service_id: tangle.service_id.unwrap_or(0),
-            wallet,
+            provider,
             shielded_credits: tangle.shielded_credits.parse()?,
-            rpc_url,
             operator_address,
             journal: match billing.settlement_journal_path.clone() {
                 Some(path) => SettlementJournal::open(path)?.map(std::sync::Arc::new),
@@ -230,8 +241,7 @@ impl BillingClient {
 
     /// Whether the authorization is on-chain and not yet claimed.
     async fn spend_open(&self, auth_hash: &str) -> anyhow::Result<bool> {
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.clone());
-        let spend = IShieldedCredits::new(self.shielded_credits, &provider)
+        let spend = IShieldedCredits::new(self.shielded_credits, &self.provider)
             .getSpendAuth(auth_hash.parse()?)
             .call()
             .await?;
@@ -292,8 +302,7 @@ impl BillingClient {
             return Ok(());
         }
 
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.clone());
-        let gas_price = provider.get_gas_price().await?;
+        let gas_price = self.provider.get_gas_price().await?;
         let gas_price_gwei = gas_price / 1_000_000_000;
 
         if gas_price_gwei > max_gwei as u128 {
@@ -310,15 +319,8 @@ impl BillingClient {
         self.check_gas_price().await?;
 
         let auth = self.build_auth(spend_auth)?;
-
-        let provider = ProviderBuilder::new()
-            .wallet(self.wallet.clone())
-            .connect_http(self.rpc_url.clone());
-
-        let contract = IShieldedCredits::new(self.shielded_credits, &provider);
-
-        let pending = contract.authorizeSpend(auth).send().await?;
-        let receipt = pending.get_receipt().await?;
+        let contract = IShieldedCredits::new(self.shielded_credits, &self.provider);
+        let receipt = self.transact(contract.authorizeSpend(auth)).await?;
         tracing::info!(
             tx_hash = %receipt.transaction_hash,
             "authorizeSpend confirmed"
@@ -413,39 +415,25 @@ impl BillingClient {
                 continue;
             }
 
-            let provider = ProviderBuilder::new()
-                .wallet(self.wallet.clone())
-                .connect_http(self.rpc_url.clone());
-
-            let contract = IShieldedCredits::new(self.shielded_credits, &provider);
-
-            let send_result = if *metered {
-                contract
-                    .settlePayment(auth_hash, operator, U256::from(*amount))
-                    .send()
-                    .await
+            let contract = IShieldedCredits::new(self.shielded_credits, &self.provider);
+            let confirmed = if *metered {
+                let settle = contract.settlePayment(auth_hash, operator, U256::from(*amount));
+                self.transact(settle).await
             } else {
-                contract.claimPayment(auth_hash, operator).send().await
+                let claim = contract.claimPayment(auth_hash, operator);
+                self.transact(claim).await
             };
-
-            match send_result {
-                Ok(pending) => match pending.get_receipt().await {
-                    Ok(receipt) => {
-                        tracing::info!(
-                            tx_hash = %receipt.transaction_hash,
-                            actual_amount = amount,
-                            attempt,
-                            "{op_label} confirmed"
-                        );
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        last_err = Some(e.into());
-                    }
-                },
-                Err(e) => {
-                    last_err = Some(e.into());
+            match confirmed {
+                Ok(receipt) => {
+                    tracing::info!(
+                        tx_hash = %receipt.transaction_hash,
+                        actual_amount = amount,
+                        attempt,
+                        "{op_label} confirmed"
+                    );
+                    return Ok(());
                 }
+                Err(e) => last_err = Some(e),
             }
         }
 
@@ -463,23 +451,29 @@ impl BillingClient {
 
     /// Return an unsettled authorization's full credit to its account; only its operator may.
     pub(crate) async fn release_payment(&self, auth: &SpendAuthPayload) -> anyhow::Result<()> {
-        let provider = ProviderBuilder::new()
-            .wallet(self.wallet.clone())
-            .connect_http(self.rpc_url.clone());
-        let contract = IShieldedCredits::new(self.shielded_credits, &provider);
-        let release = contract.releasePayment(Self::auth_hash(auth)?);
-        let receipt = release.send().await?.get_receipt().await?;
+        let contract = IShieldedCredits::new(self.shielded_credits, &self.provider);
+        let receipt = self
+            .transact(contract.releasePayment(Self::auth_hash(auth)?))
+            .await?;
         tracing::info!(tx_hash = %receipt.transaction_hash, "releasePayment confirmed");
         Ok(())
     }
 
+    /// Send under [`OPERATOR_SENDS`], then wait for the receipt concurrently with other sends.
+    async fn transact<D: CallDecoder>(
+        &self,
+        call: CallBuilder<&DynProvider, D>,
+    ) -> anyhow::Result<TransactionReceipt> {
+        let pending = {
+            let _sending = OPERATOR_SENDS.lock().await;
+            call.send().await?
+        };
+        Ok(pending.get_receipt().await?)
+    }
+
     pub async fn get_account_info(&self, commitment: &str) -> anyhow::Result<AccountInfo> {
         let commitment: B256 = commitment.parse()?;
-
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.clone());
-
-        let contract = IShieldedCredits::new(self.shielded_credits, &provider);
-
+        let contract = IShieldedCredits::new(self.shielded_credits, &self.provider);
         let result = contract.getAccount(FixedBytes(commitment.0)).call().await?;
         Ok(AccountInfo {
             spending_key: result.spendingKey,
