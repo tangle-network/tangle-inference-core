@@ -10,6 +10,7 @@ use alloy::{
 };
 
 use crate::config::{BillingConfig, TangleConfig};
+use crate::journal::{Settlement, SettlementJournal};
 use crate::server::SpendAuthPayload;
 
 /// Blueprint pricing in base token units.
@@ -123,6 +124,13 @@ sol! {
         function claimPayment(bytes32 authHash, address recipient) external;
         function settlePayment(bytes32 authHash, address recipient, uint256 amount) external;
         function releasePayment(bytes32 authHash) external;
+        function getSpendAuth(bytes32 authHash) external view returns (
+            uint256 amount,
+            address token,
+            address operator,
+            uint64 expiry,
+            bool claimed
+        );
         function getAccount(bytes32 commitment) external view returns (
             address spendingKey,
             address token,
@@ -148,6 +156,7 @@ pub struct BillingClient {
     shielded_credits: Address,
     rpc_url: reqwest::Url,
     operator_address: Address,
+    journal: Option<std::sync::Arc<SettlementJournal>>,
 }
 
 impl BillingClient {
@@ -178,7 +187,55 @@ impl BillingClient {
             shielded_credits: tangle.shielded_credits.parse()?,
             rpc_url,
             operator_address,
+            journal: match billing.settlement_journal_path.clone() {
+                Some(path) => SettlementJournal::open(path)?.map(std::sync::Arc::new),
+                None => {
+                    tracing::warn!(
+                        "settlement_journal_path not configured — an operator killed before \
+                         settlement confirms is never paid for the work it served"
+                    );
+                    None
+                }
+            },
         })
+    }
+
+    /// Settle every journaled settlement left by an earlier process, once each.
+    pub async fn settle_owed(&self) {
+        let Some(journal) = &self.journal else { return };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        for settlement in journal.owed() {
+            let hash = &settlement.auth_hash;
+            // Skip what the chain already claimed or expired, so replay never charges twice.
+            let open = settlement.spend_auth.expiry >= now
+                && match self.spend_open(hash).await {
+                    Ok(open) => open,
+                    Err(e) => {
+                        tracing::warn!(error = %e, auth_hash = %hash, "owed settlement unreadable; kept for the next start");
+                        continue;
+                    }
+                };
+            let settled = if open {
+                self.submit(&settlement).await
+            } else {
+                Ok(())
+            };
+            if let Err(e) = settled.and_then(|()| journal.settled(hash)) {
+                tracing::error!(error = %e, auth_hash = %hash, "owed settlement not settled; kept for the next start");
+            }
+        }
+    }
+
+    /// Whether the authorization is on-chain and not yet claimed.
+    async fn spend_open(&self, auth_hash: &str) -> anyhow::Result<bool> {
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.clone());
+        let spend = IShieldedCredits::new(self.shielded_credits, &provider)
+            .getSpendAuth(auth_hash.parse()?)
+            .call()
+            .await?;
+        Ok(!spend.amount.is_zero() && !spend.claimed)
     }
 
     pub fn service_id(&self) -> u64 {
@@ -277,7 +334,7 @@ impl BillingClient {
         spend_auth: &SpendAuthPayload,
         actual_amount: u64,
     ) -> anyhow::Result<()> {
-        self.settle_on_chain(spend_auth, None, actual_amount).await
+        self.settle_on_chain(spend_auth, actual_amount, false).await
     }
 
     /// Charges metered use and atomically refunds unused preauthorization.
@@ -287,29 +344,53 @@ impl BillingClient {
         spend_auth: &SpendAuthPayload,
         actual_amount: u64,
     ) -> anyhow::Result<()> {
-        self.settle_on_chain(spend_auth, Some(actual_amount), actual_amount)
-            .await
+        self.settle_on_chain(spend_auth, actual_amount, true).await
     }
 
-    /// `Some(amount)` settles metered use; `None` claims the full preauthorization.
-    /// Retries use `claim_max_retries` with exponential backoff; `audit_amount` affects logs only.
+    /// `metered` settles `amount` and refunds the rest; otherwise the full preauthorization is
+    /// claimed. The settlement is journaled first, so a killed operator settles it at its next start.
     async fn settle_on_chain(
         &self,
         spend_auth: &SpendAuthPayload,
-        metered_amount: Option<u64>,
-        audit_amount: u64,
+        amount: u64,
+        metered: bool,
     ) -> anyhow::Result<()> {
-        let auth_hash = Self::auth_hash(spend_auth)?;
+        let settlement = Settlement {
+            auth_hash: Self::auth_hash(spend_auth)?.to_string(),
+            spend_auth: spend_auth.clone(),
+            amount,
+            metered,
+        };
+        let journal = self.journal.as_deref();
+        if let Err(e) = journal.map_or(Ok(()), |j| j.owe(&settlement)) {
+            tracing::error!(error = %e, "settlement not journaled — a kill before it confirms loses it");
+        }
+        self.submit(&settlement).await?;
+        if let Err(e) = journal.map_or(Ok(()), |j| j.settled(&settlement.auth_hash)) {
+            tracing::warn!(error = %e, "confirmed settlement left in the journal; the next start skips it");
+        }
+        Ok(())
+    }
+
+    /// Send the settlement, retrying `claim_max_retries` times with exponential backoff.
+    async fn submit(&self, settlement: &Settlement) -> anyhow::Result<()> {
+        let Settlement {
+            auth_hash,
+            spend_auth,
+            amount,
+            metered,
+        } = settlement;
+        let auth_hash: B256 = auth_hash.parse()?;
         let operator: Address = spend_auth.operator.parse()?;
         let max_retries = self.claim_max_retries;
-        let op_label = if metered_amount.is_some() {
+        let op_label = if *metered {
             "settlePayment"
         } else {
             "claimPayment"
         };
 
         tracing::info!(
-            actual_amount = audit_amount,
+            actual_amount = amount,
             preauth_amount = %spend_auth.amount,
             "settling payment on-chain via {op_label}"
         );
@@ -338,14 +419,13 @@ impl BillingClient {
 
             let contract = IShieldedCredits::new(self.shielded_credits, &provider);
 
-            let send_result = match metered_amount {
-                Some(amount) => {
-                    contract
-                        .settlePayment(auth_hash, operator, U256::from(amount))
-                        .send()
-                        .await
-                }
-                None => contract.claimPayment(auth_hash, operator).send().await,
+            let send_result = if *metered {
+                contract
+                    .settlePayment(auth_hash, operator, U256::from(*amount))
+                    .send()
+                    .await
+            } else {
+                contract.claimPayment(auth_hash, operator).send().await
             };
 
             match send_result {
@@ -353,7 +433,7 @@ impl BillingClient {
                     Ok(receipt) => {
                         tracing::info!(
                             tx_hash = %receipt.transaction_hash,
-                            actual_amount = audit_amount,
+                            actual_amount = amount,
                             attempt,
                             "{op_label} confirmed"
                         );
@@ -373,10 +453,10 @@ impl BillingClient {
         tracing::error!(
             error = %err,
             auth_hash = %auth_hash,
-            actual_amount = audit_amount,
+            actual_amount = amount,
             commitment = %spend_auth.commitment,
-            "{op_label} FAILED after {} retries — operator served inference for free. Manual recovery required.",
-            max_retries
+            journaled = self.journal.is_some(),
+            "{op_label} FAILED after {max_retries} retries — a journaled settlement is retried at the next start, otherwise the operator served inference for free"
         );
         Err(err)
     }

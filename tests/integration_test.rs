@@ -206,7 +206,76 @@ struct Shielded {
     rpc: String,
     chain_id: u64,
     credits: Address,
+    token: Address,
     operator: Address,
+}
+
+/// Deploy ShieldedCredits and a test token, and fund `count` credit accounts with FUNDED each.
+async fn deploy_shielded(rpc: String, count: u8) -> anyhow::Result<(Shielded, Vec<Account>)> {
+    let operator: PrivateKeySigner = TEST_OPERATOR_KEY.parse()?;
+    let operator_address = operator.address();
+    let deployer = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(operator))
+        .connect_http(rpc.parse()?);
+    let code: Bytes = include_str!("fixtures/ShieldedCredits.bin")
+        .trim()
+        .parse()?;
+    let deploy = <Ethereum as Network>::TransactionRequest::default().with_deploy_code(code);
+    let credits = deployer
+        .send_transaction(deploy)
+        .await?
+        .get_receipt()
+        .await?
+        .contract_address
+        .expect("ShieldedCredits deployment");
+    let token = *TestToken::deploy(&deployer).await?.address();
+    let funder: PrivateKeySigner = CALLER_KEY.parse()?;
+    let funder_address = funder.address();
+    let funder = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(funder))
+        .connect_http(rpc.parse()?);
+    let funder_token = TestToken::new(token, &funder);
+    let funder_credits = ShieldedCredits::new(credits, &funder);
+    let total = U256::from(FUNDED) * U256::from(count);
+    funder_token
+        .mint(funder_address, total)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    funder_token
+        .approve(credits, total)
+        .send()
+        .await?
+        .get_receipt()
+        .await?;
+    let mut accounts = Vec::new();
+    for tag in 1..=count {
+        let account = Account {
+            commitment: B256::with_last_byte(tag),
+            key: PrivateKeySigner::from_bytes(&B256::with_last_byte(0x10 + tag))?,
+        };
+        funder_credits
+            .fundCredits(
+                token,
+                U256::from(FUNDED),
+                account.commitment,
+                account.key.address(),
+            )
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+        accounts.push(account);
+    }
+    let chain = Shielded {
+        chain_id: deployer.get_chain_id().await?,
+        rpc,
+        credits,
+        token,
+        operator: operator_address,
+    };
+    Ok((chain, accounts))
 }
 
 impl Shielded {
@@ -252,7 +321,8 @@ impl Shielded {
         }
     }
 
-    fn state(&self, min_charge_amount: u64, rails: serde_json::Value, token: Address) -> AppState {
+    /// An operator over this chain; `overrides` replace fields of the default billing config.
+    fn state(&self, overrides: serde_json::Value) -> AppState {
         let tangle = TangleConfig {
             rpc_url: self.rpc.clone(),
             chain_id: self.chain_id,
@@ -261,16 +331,21 @@ impl Shielded {
             blueprint_id: 0,
             service_id: Some(SERVICE_ID),
         };
-        let billing: BillingConfig = serde_json::from_value(serde_json::json!({
-            "payment_rails": rails,
+        let mut billing = serde_json::json!({
+            "payment_rails": { "shielded": true },
             "max_spend_per_request": 0,
             "min_credit_balance": 0,
-            "min_charge_amount": min_charge_amount,
+            "min_charge_amount": 100,
             "nonce_store_path": null,
+            "settlement_journal_path": null,
             "direct_replay_store_path": null,
-            "payment_token_address": format!("{token:#x}"),
-        }))
-        .unwrap();
+            "payment_token_address": format!("{:#x}", self.token),
+        });
+        billing
+            .as_object_mut()
+            .unwrap()
+            .extend(overrides.as_object().unwrap().clone());
+        let billing: BillingConfig = serde_json::from_value(billing).unwrap();
         let server: ServerConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         AppState::from_config(&tangle, &server, &billing, 8, ()).unwrap()
     }
@@ -304,71 +379,9 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
         return Ok(());
     }
     let anvil = AnvilInstance::spawn();
-    let rpc = anvil.rpc_url();
-    let operator: PrivateKeySigner = TEST_OPERATOR_KEY.parse()?;
-    let operator_address = operator.address();
-    let deployer = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(operator))
-        .connect_http(rpc.parse()?);
-    let code: Bytes = include_str!("fixtures/ShieldedCredits.bin")
-        .trim()
-        .parse()?;
-    let deploy = <Ethereum as Network>::TransactionRequest::default().with_deploy_code(code);
-    let credits = deployer
-        .send_transaction(deploy)
-        .await?
-        .get_receipt()
-        .await?
-        .contract_address
-        .expect("ShieldedCredits deployment");
-    let token = *TestToken::deploy(&deployer).await?.address();
-    let funder: PrivateKeySigner = CALLER_KEY.parse()?;
-    let funder_address = funder.address();
-    let funder = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(funder))
-        .connect_http(rpc.parse()?);
-    let funder_token = TestToken::new(token, &funder);
-    let funder_credits = ShieldedCredits::new(credits, &funder);
-    funder_token
-        .mint(funder_address, U256::from(4 * FUNDED))
-        .send()
-        .await?
-        .get_receipt()
-        .await?;
-    funder_token
-        .approve(credits, U256::from(4 * FUNDED))
-        .send()
-        .await?
-        .get_receipt()
-        .await?;
-    let mut accounts = Vec::new();
-    for tag in 1..=4u8 {
-        let account = Account {
-            commitment: B256::with_last_byte(tag),
-            key: PrivateKeySigner::from_bytes(&B256::with_last_byte(0x10 + tag))?,
-        };
-        funder_credits
-            .fundCredits(
-                token,
-                U256::from(FUNDED),
-                account.commitment,
-                account.key.address(),
-            )
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
-        accounts.push(account);
-    }
+    let (chain, accounts) = deploy_shielded(anvil.rpc_url(), 4).await?;
     let [a, b, c, d] = <[Account; 4]>::try_from(accounts).ok().unwrap();
-    let chain = Shielded {
-        chain_id: deployer.get_chain_id().await?,
-        rpc,
-        credits,
-        operator: operator_address,
-    };
-    let shielded = serde_json::json!({ "shielded": true });
-    let gate = chain.state(100, shielded.clone(), token);
+    let gate = chain.state(serde_json::json!({}));
     let none = HeaderMap::new();
     let healthy = || async { true };
 
@@ -448,7 +461,7 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     assert_eq!(chain.on_chain(&b).await, (FUNDED, 1));
 
     // Ceiling never below the floor: min_charge 1000 > 1.5 x 100, so exactly 1000 is accepted.
-    let floor_gate = chain.state(1000, shielded, token);
+    let floor_gate = chain.state(serde_json::json!({ "min_charge_amount": 1000 }));
     let at_floor = PaymentProof::SpendAuth(chain.sign(&c, &c.key, 1000, 0));
     let authorized = authorize_request(&floor_gate, at_floor, 100, healthy())
         .await
@@ -469,7 +482,7 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     assert_eq!(chain.on_chain(&c).await, (FUNDED - 100, 1));
 
     // Rail disabled: a direct-only operator refuses a valid SpendAuth at both gates.
-    let direct_only = chain.state(100, serde_json::json!({ "direct": true }), token);
+    let direct_only = chain.state(serde_json::json!({ "payment_rails": { "direct": true } }));
     let first = chain.sign(&d, &d.key, 300, 0);
     let (status, body) = refusal(billing_gate(&direct_only, &none, Some(first), 300).await).await;
     assert_eq!(status, 402, "{body}");
@@ -481,4 +494,115 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     assert!(body.contains("\"rail_disabled\""), "{body}");
     assert_eq!(chain.on_chain(&d).await, (FUNDED, 0));
     Ok(())
+}
+
+/// Owed minus settled records in the journal file: settlements a restart must still send.
+fn owed_in(journal: &std::path::Path) -> usize {
+    let text = std::fs::read_to_string(journal).unwrap_or_default();
+    text.matches("{\"owed\"").count() - text.matches("{\"settled\"").count()
+}
+
+/// Set the next block's base fee and mine it, so the operator's gas-price cap holds or passes.
+async fn set_base_fee(rpc: &str, gwei: u64) -> anyhow::Result<()> {
+    let provider = ProviderBuilder::new().connect_http(rpc.parse()?);
+    let wei = U256::from(gwei) * U256::from(1_000_000_000u64);
+    provider
+        .raw_request::<_, serde_json::Value>("anvil_setNextBlockBaseFeePerGas".into(), (wei,))
+        .await?;
+    provider
+        .raw_request::<_, serde_json::Value>("evm_mine".into(), ())
+        .await?;
+    Ok(())
+}
+
+#[test]
+fn killed_operator_settles_each_served_request_once_after_restart_on_anvil() -> anyhow::Result<()> {
+    if std::env::var("ANVIL_E2E").as_deref() != Ok("1") {
+        eprintln!("set ANVIL_E2E=1 to run the chain journey");
+        return Ok(());
+    }
+    let anvil = AnvilInstance::spawn();
+    let rpc = anvil.rpc_url();
+    let dir = tempfile::tempdir()?;
+    let journal = dir.path().join("data/settlements.jsonl");
+    let config = serde_json::json!({
+        "settlement_journal_path": journal,
+        "max_gas_price_gwei": 100,
+    });
+    let main = tokio::runtime::Runtime::new()?;
+    let (chain, accounts) = main.block_on(deploy_shielded(rpc.clone(), 1))?;
+    let account = &accounts[0];
+    let costs = [100u64, 150, 200, 250];
+
+    // The operator serves four requests and settles the first; the other three settlements are
+    // journaled and held by a gas spike when the operator is killed: no drain, no shutdown.
+    let operator = tokio::runtime::Runtime::new()?;
+    operator.block_on(async {
+        let state = chain.state(config.clone());
+        let mut served = Vec::new();
+        for (nonce, cost) in (0u64..).zip(costs) {
+            let proof = PaymentProof::SpendAuth(chain.sign(account, &account.key, 300, nonce));
+            let authorized = authorize_request(&state, proof, 300, async { true })
+                .await
+                .map_err(|r| anyhow::anyhow!("request {nonce} refused: {}", r.status()))?;
+            served.push((authorized, cost));
+        }
+        let (first, cost) = served.remove(0);
+        settle_request(&state, &first, Some(cost)).await;
+        assert_eq!(owed_in(&journal), 0);
+        set_base_fee(&rpc, 1_000).await?;
+        for (authorized, cost) in served {
+            let settling = state.clone();
+            state.spawn_settlement(async move {
+                settle_request(&settling, &authorized, Some(cost)).await
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while owed_in(&journal) < 3 {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "settlements never journaled"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        anyhow::Ok(())
+    })?;
+    // Cancel every task without draining it; the wait only lets the dropped journal unlock.
+    operator.shutdown_timeout(Duration::from_secs(10));
+    let served: u64 = costs.iter().sum();
+    let (url, token, operator) = (rpc.as_str(), chain.token, chain.operator);
+    let operator_paid = move || async move {
+        let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+        let paid = TestToken::new(token, provider)
+            .balanceOf(operator)
+            .call()
+            .await
+            .unwrap();
+        paid.to::<u64>()
+    };
+    main.block_on(async {
+        // Only the first settlement landed; the other three still lock their 300 pre-auths.
+        assert_eq!(owed_in(&journal), 3);
+        assert_eq!(operator_paid().await, costs[0]);
+        assert_eq!(chain.on_chain(account).await, (FUNDED - costs[0] - 900, 4));
+        set_base_fee(&rpc, 1).await?;
+
+        // A fresh operator on the same journal settles every owed request.
+        let owed = std::fs::read(&journal)?;
+        let restarted = chain.state(config.clone());
+        restarted.drain_settlements().await;
+        assert_eq!(owed_in(&journal), 0);
+        assert_eq!(operator_paid().await, served);
+        assert_eq!(chain.on_chain(account).await, (FUNDED - served, 4));
+        drop(restarted);
+
+        // Killed again after confirming but before forgetting them: replay charges nothing twice.
+        std::fs::write(&journal, owed)?;
+        let replayed = chain.state(config.clone());
+        replayed.drain_settlements().await;
+        assert_eq!(owed_in(&journal), 0);
+        assert_eq!(operator_paid().await, served);
+        assert_eq!(chain.on_chain(account).await, (FUNDED - served, 4));
+        anyhow::Ok(())
+    })
 }
