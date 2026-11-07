@@ -596,3 +596,59 @@ fn killed_operator_settles_each_served_request_once_after_restart_on_anvil() -> 
         anyhow::Ok(())
     })
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_requests_authorize_and_settle_each_once_on_anvil() -> anyhow::Result<()> {
+    if std::env::var("ANVIL_E2E").as_deref() != Ok("1") {
+        eprintln!("set ANVIL_E2E=1 to run the chain journey");
+        return Ok(());
+    }
+    let anvil = AnvilInstance::spawn();
+    let (chain, accounts) = deploy_shielded(anvil.rpc_url(), 8).await?;
+    // No retries: each concurrent operator transaction must land on its first send.
+    let state = chain.state(serde_json::json!({ "claim_max_retries": 0 }));
+    let costs: Vec<u64> = (0..8).map(|i| 100 + 10 * i).collect();
+    let mut requests = tokio::task::JoinSet::new();
+    for (account, &cost) in accounts.iter().zip(&costs) {
+        let proof = PaymentProof::SpendAuth(chain.sign(account, &account.key, 300, 0));
+        let state = state.clone();
+        requests.spawn(async move {
+            match authorize_request(&state, proof, 300, async { true }).await {
+                Ok(authorized) => Ok((authorized, cost)),
+                Err(response) => Err(refusal::<()>(Err(response)).await),
+            }
+        });
+    }
+    let (authorized, refused): (Vec<_>, Vec<_>) = requests
+        .join_all()
+        .await
+        .into_iter()
+        .partition(Result::is_ok);
+    let refused: Vec<_> = refused.into_iter().filter_map(Result::err).collect();
+    assert!(
+        refused.is_empty(),
+        "{} of 8 refused: {refused:?}",
+        refused.len()
+    );
+    for account in &accounts {
+        assert_eq!(chain.on_chain(account).await, (FUNDED - 300, 1));
+    }
+
+    for (authorized, cost) in authorized.into_iter().filter_map(Result::ok) {
+        let settling = state.clone();
+        state.spawn_settlement(
+            async move { settle_request(&settling, &authorized, Some(cost)).await },
+        );
+    }
+    state.drain_settlements().await;
+    let provider = ProviderBuilder::new().connect_http(chain.rpc.parse()?);
+    let paid = TestToken::new(chain.token, provider)
+        .balanceOf(chain.operator)
+        .call()
+        .await?;
+    assert_eq!(paid, U256::from(costs.iter().sum::<u64>()));
+    for (account, cost) in accounts.iter().zip(costs) {
+        assert_eq!(chain.on_chain(account).await, (FUNDED - cost, 1));
+    }
+    Ok(())
+}
