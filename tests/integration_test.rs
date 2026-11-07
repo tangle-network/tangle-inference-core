@@ -15,7 +15,7 @@ use std::{
 use tangle_inference_core::{
     config::{BillingConfig, ServerConfig, TangleConfig},
     payment::{DirectProvider, PaymentProof, PaymentProvider},
-    server::{authorize_request, billing_gate, AppState, SpendAuthPayload},
+    server::{authorize_request, billing_gate, settle_request, AppState, SpendAuthPayload},
 };
 
 const TEST_OPERATOR_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -448,6 +448,16 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
         .map_err(|r| anyhow::anyhow!("SpendAuth at the floor refused: {}", r.status()))?;
     assert_eq!(authorized.preauth, Some(1000));
     assert_eq!(chain.on_chain(&c).await, (FUNDED - 1000, 1));
+    // A settlement spawned past the response still lands when the server drains at shutdown.
+    let settling = floor_gate.clone();
+    floor_gate
+        .spawn_settlement(async move { settle_request(&settling, &authorized, Some(100)).await });
+    floor_gate.drain_settlements().await;
+    let (balance, nonce) = chain.on_chain(&c).await;
+    assert!(
+        balance > FUNDED - 1000 && nonce == 1,
+        "drained settlement refunded nothing: {balance}"
+    );
     let over = PaymentProof::SpendAuth(chain.sign(&c, &c.key, 1001, 1));
     let (status, body) = refusal(authorize_request(&floor_gate, over, 100, healthy()).await).await;
     assert_eq!(status, 400, "{body}");
