@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::{net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tangle_inference_core::engine::{EngineConfig, EngineKind, EngineProcess, RecipeCatalog};
 
 struct WorkerCleanup(PathBuf);
@@ -39,23 +39,38 @@ async fn isolated(test: &str, environment: &[(&str, &str)]) -> anyhow::Result<bo
     Ok(true)
 }
 
-fn config(engine: EngineKind) -> EngineConfig {
-    EngineConfig {
+/// Holds 3 ports for the test: bound exclusively, never listening, then reusable by engines alone.
+fn config(engine: EngineKind) -> (EngineConfig, Vec<tokio::net::TcpSocket>) {
+    let bind = |port: u16| {
+        let socket = tokio::net::TcpSocket::new_v4().ok()?;
+        socket.bind(([127, 0, 0, 1], port).into()).ok()?;
+        socket.set_reuseaddr(true).ok()?;
+        Some(socket)
+    };
+    let ports = (0..100)
+        .find_map(|_| {
+            let first = bind(0)?;
+            let port = first.local_addr().ok()?.port();
+            Some(vec![
+                first,
+                bind(port.checked_add(1)?)?,
+                bind(port.checked_add(2)?)?,
+            ])
+        })
+        .expect("no consecutive loopback ports");
+    let config = EngineConfig {
         engine,
         model: "acme/derived-glm".into(),
         base_family: Some("glm-5.3".into()),
         host: "127.0.0.1".into(),
-        port: TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port(),
+        port: ports[0].local_addr().unwrap().port(),
         tensor_parallel_size: 8,
         gpu_class: Some("nvidia-h200".into()),
         max_model_len: 4096,
         startup_timeout_secs: 5,
         ..EngineConfig::default()
-    }
+    };
+    (config, ports)
 }
 
 fn option<'a>(argv: &'a [String], flag: &str) -> &'a str {
@@ -145,7 +160,7 @@ async fn recipes_reach_child_and_processes_are_reaped() -> anyhow::Result<()> {
         let pids = dir.path().join("workers");
         std::fs::write(&pids, "")?;
         let _cleanup = WorkerCleanup(pids.clone());
-        let mut cfg = config(engine);
+        let (mut cfg, _ports) = config(engine);
         cfg.host = "0.0.0.0".into();
         let port = cfg.port;
         if engine == EngineKind::Sglang {
@@ -341,7 +356,7 @@ async fn startup_failure_is_bounded_and_external_restart_is_refused() -> anyhow:
     let dir = tempfile::tempdir()?;
     let script = dir.path().join("exit.py");
     std::fs::write(&script, "raise SystemExit(17)\n")?;
-    let mut cfg = config(EngineKind::Sglang);
+    let (mut cfg, _ports) = config(EngineKind::Sglang);
     cfg.command = format!("python3 {}", script.display());
     cfg.router_command = cfg.command.clone();
     let process = EngineProcess::spawn(cfg.clone()).await?;
@@ -374,25 +389,14 @@ async fn replica_set_owns_workers_router_and_device_partitions() -> anyhow::Resu
     }
     let dir = tempfile::tempdir()?;
     let (script, _) = child_script(dir.path())?;
-    // Reserve a contiguous range without choosing a fixed shared test port.
-    let (port, reservations) = (0..100)
-        .find_map(|_| {
-            let first = TcpListener::bind("127.0.0.1:0").ok()?;
-            let port = first.local_addr().ok()?.port();
-            let second = TcpListener::bind(("127.0.0.1", port.checked_add(1)?)).ok()?;
-            let third = TcpListener::bind(("127.0.0.1", port.checked_add(2)?)).ok()?;
-            Some((port, [first, second, third]))
-        })
-        .ok_or_else(|| anyhow::anyhow!("no contiguous loopback ports"))?;
-    let mut value = serde_json::to_value(config(EngineKind::Sglang))?;
+    let (config, _ports) = config(EngineKind::Sglang);
+    let mut value = serde_json::to_value(config)?;
     value["base_family"] = "deepseek-v4.1-flash".into();
     value["gpu_class"] = "nvidia-b200".into();
     value["tensor_parallel_size"] = 4.into();
-    value["port"] = port.into();
     value["replicas"] = 2.into();
     value["command"] = format!("python3 {} {}", script.display(), dir.path().display()).into();
     value["router_command"] = value["command"].clone();
-    drop(reservations);
     let process = EngineProcess::spawn(serde_json::from_value(value)?).await?;
     process.wait_ready().await?;
     let result: serde_json::Value = process
