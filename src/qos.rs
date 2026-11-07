@@ -110,7 +110,11 @@ async fn send_heartbeat(
     let registry = IOperatorStatusRegistry::new(registry_addr, &provider);
     let call = registry.submitHeartbeat(service_id, blueprint_id, block_number, metric_pairs);
 
-    let tx_hash = call.send().await?.watch().await?;
+    let pending = {
+        let _sending = crate::billing::OPERATOR_SENDS.lock().await;
+        call.send().await?
+    };
+    let tx_hash = pending.watch().await?;
     tracing::trace!(?tx_hash, "heartbeat tx confirmed");
 
     Ok(())
