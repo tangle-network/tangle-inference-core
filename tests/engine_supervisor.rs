@@ -80,6 +80,7 @@ p.add_argument("--served-model-name")
 p.add_argument("--worker-urls", nargs="+")
 p.add_argument("--policy")
 a, _ = p.parse_known_args()
+sys.stderr = open(os.path.join(a.receipt if os.path.isdir(a.receipt) else os.path.dirname(a.receipt), str(a.port)+'.err'), 'a', buffering=1)
 if a.pids and sys.platform.startswith('linux'):
     ready, notify = os.pipe()
     if os.fork() == 0:
@@ -394,7 +395,16 @@ async fn replica_set_owns_workers_router_and_device_partitions() -> anyhow::Resu
     value["router_command"] = value["command"].clone();
     drop(reservations);
     let process = EngineProcess::spawn(serde_json::from_value(value)?).await?;
-    process.wait_ready().await?;
+    if let Err(error) = process.wait_ready().await {
+        let mut logs = String::new();
+        for file in std::fs::read_dir(dir.path())? {
+            let path = file?.path();
+            if path.extension().and_then(|x| x.to_str()) == Some("err") {
+                logs += &format!("{}: {}\n", path.display(), std::fs::read_to_string(&path)?);
+            }
+        }
+        anyhow::bail!("{error}; reserved port {port}; child stderr:\n{logs}");
+    }
     let result: serde_json::Value = process
         .client()
         .get(format!("{}/workers", process.endpoint()))
