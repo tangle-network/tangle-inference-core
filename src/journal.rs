@@ -72,12 +72,8 @@ impl SettlementJournal {
         if let Ok(file) = File::open(&path) {
             for line in BufReader::new(file).lines() {
                 match serde_json::from_str(&line?) {
-                    Ok(Record::Owed(s)) => {
-                        owed.insert(s.auth_hash.clone(), s);
-                    }
-                    Ok(Record::Settled(hash)) => {
-                        owed.remove(&hash);
-                    }
+                    Ok(Record::Owed(s)) => _ = owed.insert(s.auth_hash.clone(), s),
+                    Ok(Record::Settled(hash)) => _ = owed.remove(&hash),
                     Err(e) => tracing::warn!(error = %e, "skipping unreadable settlement record"),
                 }
             }

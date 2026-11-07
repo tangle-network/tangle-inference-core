@@ -158,7 +158,6 @@ pub struct BillingClient {
     claim_max_retries: u32,
     receipt_timeout: Duration,
     max_gas_price_gwei: u64,
-    service_id: u64,
     credits: IShieldedCredits::IShieldedCreditsInstance<DynProvider>,
     operator_address: Address,
     journal: Option<std::sync::Arc<SettlementJournal>>,
@@ -191,15 +190,20 @@ impl BillingClient {
             .connect_http(tangle.rpc_url.parse()?)
             .erased();
 
+        let service_id = tangle.service_id.unwrap_or(0);
         Ok(Self {
             claim_max_retries: billing.claim_max_retries,
             receipt_timeout: Duration::from_secs(billing.receipt_timeout_secs),
             max_gas_price_gwei: billing.max_gas_price_gwei,
-            service_id: tangle.service_id.unwrap_or(0),
             credits: IShieldedCredits::new(tangle.shielded_credits.parse()?, provider),
             operator_address,
             journal: match billing.settlement_journal_path.clone() {
-                Some(path) => SettlementJournal::open(path)?.map(std::sync::Arc::new),
+                // One journal per operator and service: a host's operators share a working dir,
+                // and only the designated operator may settle an entry.
+                Some(path) => SettlementJournal::open(
+                    path.with_extension(format!("{service_id}.{operator_address:#x}.jsonl")),
+                )?
+                .map(std::sync::Arc::new),
                 None => {
                     tracing::warn!(
                         "settlement_journal_path not configured — an operator killed before \
@@ -217,7 +221,9 @@ impl BillingClient {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        for settlement in journal.owed() {
+        let mine =
+            |s: &Settlement| s.spend_auth.operator.parse().ok() == Some(self.operator_address);
+        for settlement in journal.owed().into_iter().filter(mine) {
             let hash = &settlement.auth_hash;
             // Skip what the chain already claimed or expired, so replay never charges twice.
             let open = settlement.spend_auth.expiry >= now
@@ -244,10 +250,6 @@ impl BillingClient {
         let spend = self.credits.getSpendAuth(auth_hash.parse()?);
         let spend = spend.call().await?;
         Ok(!spend.amount.is_zero() && !spend.claimed)
-    }
-
-    pub fn service_id(&self) -> u64 {
-        self.service_id
     }
 
     pub fn operator_address(&self) -> Address {
