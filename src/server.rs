@@ -403,7 +403,8 @@ pub fn acquire_permit(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePer
     })
 }
 
-/// Extract, validate and pre-authorize a SpendAuth; callers settle via [`settle_billing`].
+/// Extract, validate and pre-authorize a SpendAuth; callers settle via [`settle_billing`], or
+/// release the credit with [`BillingClient::release_payment`] when they fail to serve.
 #[allow(clippy::result_large_err)]
 pub async fn billing_gate(
     state: &AppState,
@@ -493,7 +494,7 @@ pub async fn settle_billing(
 ) -> Result<(), anyhow::Error> {
     let charge = actual_cost.unwrap_or(preauth_amount).min(preauth_amount);
     if charge == 0 {
-        return Ok(());
+        return billing.release_payment(spend_auth).await;
     }
     tracing::info!(actual_cost, preauth_amount, charge, "settling billing");
     if actual_cost.is_some() {
@@ -515,6 +516,31 @@ pub struct AuthorizedPayment {
     /// (already paid in full).
     pub preauth: Option<u64>,
     _account_guard: Option<AccountGuard>,
+    /// Until settlement takes it, dropping the payment releases the shielded credit.
+    unsettled: std::sync::Mutex<Option<AppState>>,
+}
+
+impl Drop for AuthorizedPayment {
+    fn drop(&mut self) {
+        let unsettled = self.unsettled.get_mut().unwrap_or_else(|e| e.into_inner());
+        let (Some(state), PaymentProof::SpendAuth(spend_auth)) = (unsettled.take(), &self.proof)
+        else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::error!(
+                "authorization dropped outside Tokio; credit stays locked until expiry"
+            );
+            return;
+        }
+        let spend_auth = spend_auth.clone();
+        let releasing = state.clone();
+        state.spawn_settlement(async move {
+            if let Err(e) = releasing.billing.release_payment(&spend_auth).await {
+                tracing::error!(error = %e, "releasePayment failed; credit stays locked until expiry");
+            }
+        });
+    }
 }
 
 /// Resolve a request's payment proof, in priority order: an explicit
@@ -645,16 +671,22 @@ pub async fn authorize_request(
         }
     }
 
+    let unsettled = preauth.map(|_| state.clone());
     Ok(AuthorizedPayment {
         proof,
         preauth,
         _account_guard: account_guard,
+        unsettled: std::sync::Mutex::new(unsettled),
     })
 }
 
 /// Settle after serving: shielded settles metered usage, or claims the pre-auth when usage is
 /// unknown; direct is already paid. Errors are logged; the served response stands.
 pub async fn settle_request(state: &AppState, auth: &AuthorizedPayment, actual_cost: Option<u64>) {
+    auth.unsettled
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     if let PaymentProof::SpendAuth(ref spend_auth) = auth.proof {
         if let Some(preauth) = auth.preauth {
             if let Err(e) = settle_billing(&state.billing, spend_auth, preauth, actual_cost).await {
