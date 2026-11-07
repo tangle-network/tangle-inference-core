@@ -198,10 +198,9 @@ impl BillingClient {
             credits: IShieldedCredits::new(tangle.shielded_credits.parse()?, provider),
             operator_address,
             journal: match billing.settlement_journal_path.clone() {
-                // One journal per operator and service: a host's operators share a working dir,
-                // and only the designated operator may settle an entry.
                 Some(path) => SettlementJournal::open(
                     path.with_extension(format!("{service_id}.{operator_address:#x}.jsonl")),
+                    operator_address,
                 )?
                 .map(std::sync::Arc::new),
                 None => {
