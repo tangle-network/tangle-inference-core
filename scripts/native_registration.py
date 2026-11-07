@@ -1,6 +1,4 @@
-"""Register a blueprint natively on local Anvil with the released cargo-tangle and check what the chain recorded.
-
-The blueprint supplies deploy/definition.json and a Forge script that prints DEPLOY_MANAGER=<address>."""
+"""Register a blueprint (deploy/definition.json; a Forge script printing DEPLOY_MANAGER=<address>) on local Anvil with the released cargo-tangle, then check what the chain recorded."""
 import argparse
 import hashlib
 import json
@@ -73,7 +71,9 @@ def read(address, signature):
 
 run(['forge', 'soldeer', 'update', '--config-location', 'foundry', '--quiet'])
 shutil.copyfile(Path(__file__).resolve().with_name('NativeRegistryFixture.s.sol'), fixture)
-with tempfile.TemporaryDirectory(prefix='native-registration-') as temp:
+# Keep run state in the checkout: host /tmp reapers removed it mid-run on loaded gate hosts.
+(contracts / 'cache').mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(prefix='native-registration-', dir=contracts / 'cache') as temp:
     temp = Path(temp)
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
