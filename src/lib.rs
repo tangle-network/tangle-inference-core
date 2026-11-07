@@ -11,6 +11,8 @@ pub mod qos;
 
 #[cfg(feature = "billing")]
 pub mod billing;
+#[cfg(feature = "billing")]
+pub mod journal;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(feature = "billing")]

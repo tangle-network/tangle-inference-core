@@ -179,6 +179,10 @@ pub struct BillingConfig {
     #[serde(default = "default_nonce_store_path")]
     pub nonce_store_path: Option<PathBuf>,
 
+    /// Settlements owed for served work, settled at the next start if the operator is killed first.
+    #[serde(default = "default_settlement_journal_path")]
+    pub settlement_journal_path: Option<PathBuf>,
+
     /// Persist consumed transfers to prevent replay after restart.
     #[serde(default = "default_direct_replay_store_path")]
     pub direct_replay_store_path: Option<PathBuf>,
@@ -246,6 +250,10 @@ fn default_clock_skew_tolerance() -> u64 {
 
 fn default_nonce_store_path() -> Option<PathBuf> {
     Some(PathBuf::from("data/nonces.json"))
+}
+
+fn default_settlement_journal_path() -> Option<PathBuf> {
+    Some(PathBuf::from("data/settlements.jsonl"))
 }
 
 fn default_direct_replay_store_path() -> Option<PathBuf> {

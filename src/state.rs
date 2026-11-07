@@ -364,6 +364,17 @@ impl AppStateBuilder {
         } else {
             None
         };
+        // Settle what a killed predecessor left owed; drain_settlements waits for it.
+        let settlements = tokio_util::task::TaskTracker::new();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let owed = billing.clone();
+                settlements.spawn_on(async move { owed.settle_owed().await }, &runtime);
+            }
+            Err(_) => tracing::warn!(
+                "AppState built outside Tokio — owed settlements wait for the next start"
+            ),
+        }
         Ok(AppState {
             billing,
             nonce_store,
@@ -376,7 +387,7 @@ impl AppStateBuilder {
             payment_provider,
             backend,
             endpoint_authorization,
-            settlements: tokio_util::task::TaskTracker::new(),
+            settlements,
         })
     }
 }
