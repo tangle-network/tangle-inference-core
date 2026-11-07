@@ -7,7 +7,7 @@ use alloy::{
     sol,
     sol_types::{eip712_domain, SolStruct},
 };
-use axum::{http::HeaderMap, response::Response};
+use axum::response::Response;
 use std::{
     process::{Child, Command, Stdio},
     time::Duration,
@@ -15,7 +15,7 @@ use std::{
 use tangle_inference_core::{
     config::{BillingConfig, ServerConfig, TangleConfig},
     payment::{DirectProvider, PaymentProof, PaymentProvider},
-    server::{authorize_request, billing_gate, settle_request, AppState, SpendAuthPayload},
+    server::{authorize_request, settle_request, AppState, SpendAuthPayload},
 };
 
 const TEST_OPERATOR_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -382,36 +382,29 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     let (chain, accounts) = deploy_shielded(anvil.rpc_url(), 4).await?;
     let [a, b, c, d] = <[Account; 4]>::try_from(accounts).ok().unwrap();
     let gate = chain.state(serde_json::json!({}));
-    let none = HeaderMap::new();
     let healthy = || async { true };
 
     // Nonce order: neither an unsigned nor a foreign-signed SpendAuth consumes (commitment, 0).
     let mut unsigned = chain.sign(&a, &a.key, 300, 0);
     unsigned.signature = "0x".into();
-    let (status, body) = refusal(billing_gate(&gate, &none, Some(unsigned), 300).await).await;
+    let unsigned = PaymentProof::SpendAuth(unsigned);
+    let (status, body) = refusal(authorize_request(&gate, unsigned, 300, healthy()).await).await;
     assert_eq!(status, 402, "{body}");
     assert!(body.contains("\"invalid_spend_auth\""), "{body}");
-    let foreign = chain.sign(
-        &a,
-        &PrivateKeySigner::from_bytes(&B256::with_last_byte(0xff))?,
-        300,
-        0,
-    );
-    let (status, body) = refusal(billing_gate(&gate, &none, Some(foreign), 300).await).await;
+    let foreign_key = PrivateKeySigner::from_bytes(&B256::with_last_byte(0xff))?;
+    let foreign = PaymentProof::SpendAuth(chain.sign(&a, &foreign_key, 300, 0));
+    let (status, body) = refusal(authorize_request(&gate, foreign, 300, healthy()).await).await;
     assert_eq!(status, 402, "{body}");
     assert!(body.contains("\"signer_mismatch\""), "{body}");
     // Floor: a SpendAuth equal to max(estimate, min_charge) passes and authorizes on-chain.
-    let valid = chain.sign(&a, &a.key, 300, 0);
-    let (spend_auth, preauth) = billing_gate(&gate, &none, Some(valid.clone()), 300)
+    let valid = PaymentProof::SpendAuth(chain.sign(&a, &a.key, 300, 0));
+    let at_floor = authorize_request(&gate, valid.clone(), 300, healthy())
         .await
         .map_err(|r| anyhow::anyhow!("valid SpendAuth refused: {}", r.status()))?;
-    assert_eq!((spend_auth.is_some(), preauth), (true, Some(300)));
+    assert_eq!(at_floor.preauth, Some(300));
     assert_eq!(chain.on_chain(&a).await, (FUNDED - 300, 1));
-    // A validly signed replay is refused by both gates without touching the chain.
-    let (status, body) = refusal(billing_gate(&gate, &none, Some(valid.clone()), 300).await).await;
-    assert_eq!(status, 400, "{body}");
-    assert!(body.contains("\"nonce_replay\""), "{body}");
-    let replay = authorize_request(&gate, PaymentProof::SpendAuth(valid), 300, healthy()).await;
+    // A validly signed replay is refused without touching the chain.
+    let replay = authorize_request(&gate, valid, 300, healthy()).await;
     let (status, body) = refusal(replay).await;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("\"nonce_replay\""), "{body}");
@@ -441,8 +434,8 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     assert_eq!(chain.on_chain(&a).await, (FUNDED - 750, 3));
 
     // Floor: one unit under the estimate is a 402 quoting the floor, before authorizeSpend.
-    let short = chain.sign(&b, &b.key, 299, 0);
-    let response = billing_gate(&gate, &none, Some(short), 300)
+    let short = PaymentProof::SpendAuth(chain.sign(&b, &b.key, 299, 0));
+    let response = authorize_request(&gate, short, 300, healthy())
         .await
         .err()
         .unwrap();
@@ -451,13 +444,14 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     assert_eq!(status, 402, "{body}");
     assert!(body.contains("\"payment_required\""), "{body}");
     assert_eq!(chain.on_chain(&b).await, (FUNDED, 0));
-    let retry = chain.sign(&b, &b.key, 300, 0);
-    billing_gate(&gate, &none, Some(retry.clone()), 300)
+    let retry = PaymentProof::SpendAuth(chain.sign(&b, &b.key, 300, 0));
+    let retried = authorize_request(&gate, retry, 300, healthy())
         .await
         .map_err(|r| anyhow::anyhow!("retry after the floor refusal refused: {}", r.status()))?;
     assert_eq!(chain.on_chain(&b).await, (FUNDED - 300, 1));
-    // A billing_gate caller that fails to serve releases the credit itself.
-    gate.billing.release_payment(&retry).await?;
+    // A caller that fails to serve drops the payment, which releases the credit.
+    drop(retried);
+    gate.drain_settlements().await;
     assert_eq!(chain.on_chain(&b).await, (FUNDED, 1));
 
     // Ceiling never below the floor: min_charge 1000 > 1.5 x 100, so exactly 1000 is accepted.
@@ -481,15 +475,11 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     assert!(body.contains("\"excessive_preauth\""), "{body}");
     assert_eq!(chain.on_chain(&c).await, (FUNDED - 100, 1));
 
-    // Rail disabled: a direct-only operator refuses a valid SpendAuth at both gates.
+    // Rail disabled: a direct-only operator refuses a valid SpendAuth.
     let direct_only = chain.state(serde_json::json!({ "payment_rails": { "direct": true } }));
-    let first = chain.sign(&d, &d.key, 300, 0);
-    let (status, body) = refusal(billing_gate(&direct_only, &none, Some(first), 300).await).await;
-    assert_eq!(status, 402, "{body}");
-    assert!(body.contains("\"rail_disabled\""), "{body}");
-    let second = PaymentProof::SpendAuth(chain.sign(&d, &d.key, 300, 0));
+    let valid = PaymentProof::SpendAuth(chain.sign(&d, &d.key, 300, 0));
     let (status, body) =
-        refusal(authorize_request(&direct_only, second, 300, healthy()).await).await;
+        refusal(authorize_request(&direct_only, valid, 300, healthy()).await).await;
     assert_eq!(status, 402, "{body}");
     assert!(body.contains("\"rail_disabled\""), "{body}");
     assert_eq!(chain.on_chain(&d).await, (FUNDED, 0));
