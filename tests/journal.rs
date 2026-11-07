@@ -8,7 +8,7 @@ fn open_drops_a_line_this_operator_will_not_settle() {
     let mine = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
     let line = |operator: &str, hash: &str| {
         format!(
-            r#"{{"owed":{{"auth_hash":"{hash}","spend_auth":{{"commitment":"0x01","service_id":1,"job_index":0,"amount":"1","operator":"{operator}","nonce":0,"expiry":1,"signature":"0x"}},"amount":1,"metered":false}}}}"#
+            r#"{{"owed":{{"auth_hash":"{hash}","spend_auth":{{"commitment":"0x01","serviceId":1,"jobIndex":0,"amount":"1","operator":"{operator}","nonce":0,"expiry":1,"signature":"0x"}},"amount":1,"metered":false}}}}"#
         )
     };
     std::fs::write(
