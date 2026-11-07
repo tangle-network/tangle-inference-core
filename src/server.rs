@@ -444,11 +444,11 @@ pub async fn billing_gate(
 
 /// Settlement charges at most the pre-authorization, so it must cover the request's maximum cost.
 #[allow(clippy::result_large_err)]
-fn require_preauth_covers(state: &AppState, preauth: u64, max_cost: u64) -> Result<(), Response> {
+fn require_preauth_covers(state: &AppState, preauth: u64, max_cost: u64) -> Result<u64, Response> {
     let floor = max_cost.max(state.billing_config.min_charge_amount);
     let (b, t) = (&state.billing_config, &state.tangle_config);
     (preauth >= floor)
-        .then_some(())
+        .then_some(floor)
         .ok_or_else(|| payment_required(b, t, state.operator_address, floor))
 }
 
@@ -549,9 +549,17 @@ pub async fn authorize_request(
     let preauth = match &proof {
         PaymentProof::SpendAuth(spend_auth) => {
             let preauth = validate_spend_auth(state, spend_auth).await?;
-            require_preauth_covers(state, preauth, estimated_max_cost)?;
-            // Cap locked credit at 1.5x the estimate; settlePayment refunds the unused part.
-            let ceiling = estimated_max_cost.saturating_mul(3) / 2;
+            if !state.billing_config.payment_rails.shielded {
+                return Err(error_response(
+                    StatusCode::PAYMENT_REQUIRED,
+                    "shielded rail not enabled on this operator".into(),
+                    "billing_error",
+                    "rail_disabled",
+                ));
+            }
+            let floor = require_preauth_covers(state, preauth, estimated_max_cost)?;
+            // Cap locked credit at 1.5x the estimate, never below the floor; settlePayment refunds the rest.
+            let ceiling = (estimated_max_cost.saturating_mul(3) / 2).max(floor);
             if estimated_max_cost > 0 && preauth > ceiling {
                 return Err(error_response(
                     StatusCode::BAD_REQUEST,

@@ -63,7 +63,7 @@ impl ShieldedProvider {
 
 #[async_trait]
 impl PaymentProvider for ShieldedProvider {
-    async fn authorize(&self, proof: &PaymentProof, _required: u64) -> anyhow::Result<u64> {
+    async fn authorize(&self, proof: &PaymentProof, required: u64) -> anyhow::Result<u64> {
         let PaymentProof::SpendAuth(spend_auth) = proof else {
             anyhow::bail!(
                 "ShieldedProvider requires SpendAuth proof, got {:?}",
@@ -71,6 +71,10 @@ impl PaymentProvider for ShieldedProvider {
             );
         };
         let amount: u64 = spend_auth.amount.parse()?;
+        anyhow::ensure!(
+            amount >= required,
+            "SpendAuth {amount} is below the required {required}"
+        );
         self.client.authorize_spend(spend_auth).await?;
         Ok(amount)
     }
