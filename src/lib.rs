@@ -37,9 +37,9 @@ pub use payment::{
 };
 #[cfg(all(feature = "http", feature = "billing"))]
 pub use server::{
-    acquire_permit, billing_gate, error_response, extract_x402_spend_auth, gpu_health_handler,
-    metrics_handler, payment_required, settle_billing, validate_spend_auth, AccountGuard, AppState,
-    AppStateBuilder, ErrorDetail, ErrorResponse, NonceStore, SpendAuthPayload,
+    acquire_permit, error_response, extract_x402_spend_auth, gpu_health_handler, metrics_handler,
+    payment_required, validate_spend_auth, AccountGuard, AppState, AppStateBuilder, ErrorDetail,
+    ErrorResponse, NonceStore, SpendAuthPayload,
 };
 
 // Always available
