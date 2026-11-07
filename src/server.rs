@@ -428,19 +428,36 @@ pub async fn billing_gate(
 
     require_shielded_rail(state)?;
     let preauth_amount = validate_spend_auth(state, &spend_auth).await?;
-    require_preauth_covers(state, preauth_amount, estimated_cost)?;
+    let proof = PaymentProof::SpendAuth(spend_auth.clone());
+    if let Err(response) = require_preauth_covers(state, preauth_amount, estimated_cost) {
+        return Err(refuse(state, &proof, response).await);
+    }
 
     if let Err(e) = state.billing.authorize_spend(&spend_auth).await {
         tracing::error!(error = %e, "authorizeSpend failed");
-        return Err(error_response(
-            StatusCode::PAYMENT_REQUIRED,
-            format!("billing authorization failed: {e}"),
-            "billing_error",
-            "authorization_failed",
-        ));
+        return Err(refuse(
+            state,
+            &proof,
+            error_response(
+                StatusCode::PAYMENT_REQUIRED,
+                format!("billing authorization failed: {e}"),
+                "billing_error",
+                "authorization_failed",
+            ),
+        )
+        .await);
     }
 
     Ok((Some(spend_auth), Some(preauth_amount)))
+}
+
+/// A refusal after validation frees the SpendAuth's nonce, which the contract requires on retry.
+async fn refuse(state: &AppState, proof: &PaymentProof, response: Response) -> Response {
+    if let PaymentProof::SpendAuth(spend_auth) = proof {
+        let key = (spend_auth.commitment.clone(), spend_auth.nonce);
+        state.nonce_store.release(&key).await;
+    }
+    response
 }
 
 /// A SpendAuth is a shielded-rail proof; an operator that disabled the rail must refuse it.
@@ -563,21 +580,29 @@ pub async fn authorize_request(
     // Validate FIRST (cheap, precise errors) — before the backend-health check.
     let preauth = match &proof {
         PaymentProof::SpendAuth(spend_auth) => {
-            let preauth = validate_spend_auth(state, spend_auth).await?;
             require_shielded_rail(state)?;
-            let floor = require_preauth_covers(state, preauth, estimated_max_cost)?;
+            let preauth = validate_spend_auth(state, spend_auth).await?;
+            let floor = match require_preauth_covers(state, preauth, estimated_max_cost) {
+                Ok(floor) => floor,
+                Err(response) => return Err(refuse(state, &proof, response).await),
+            };
             // Cap locked credit at 1.5x the estimate, never below the floor; settlePayment refunds the rest.
             let ceiling = (estimated_max_cost.saturating_mul(3) / 2).max(floor);
             if estimated_max_cost > 0 && preauth > ceiling {
-                return Err(error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "pre-auth amount ({preauth}) exceeds 1.5x estimated max cost \
+                return Err(refuse(
+                    state,
+                    &proof,
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "pre-auth amount ({preauth}) exceeds 1.5x estimated max cost \
                          ({estimated_max_cost}) — reduce amount to avoid locking excess credit"
+                        ),
+                        "billing_error",
+                        "excessive_preauth",
                     ),
-                    "billing_error",
-                    "excessive_preauth",
-                ));
+                )
+                .await);
             }
             Some(preauth)
         }
@@ -586,7 +611,7 @@ pub async fn authorize_request(
 
     // Don't commit gas / verify a payment for a backend we can't serve.
     if !is_healthy.await {
-        return Err(backend_unavailable());
+        return Err(refuse(state, &proof, backend_unavailable()).await);
     }
 
     // Commit: shielded authorizes on-chain; direct verifies the transfer.
@@ -594,12 +619,17 @@ pub async fn authorize_request(
         PaymentProof::SpendAuth(spend_auth) => {
             if let Err(e) = state.billing.authorize_spend(spend_auth).await {
                 tracing::error!(error = %e, "authorizeSpend failed");
-                return Err(error_response(
-                    StatusCode::PAYMENT_REQUIRED,
-                    format!("billing authorization failed: {e}"),
-                    "billing_error",
-                    "authorization_failed",
-                ));
+                return Err(refuse(
+                    state,
+                    &proof,
+                    error_response(
+                        StatusCode::PAYMENT_REQUIRED,
+                        format!("billing authorization failed: {e}"),
+                        "billing_error",
+                        "authorization_failed",
+                    ),
+                )
+                .await);
             }
         }
         PaymentProof::DirectTransfer { .. } => {

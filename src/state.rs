@@ -68,6 +68,14 @@ impl NonceStore {
         false // fresh
     }
 
+    /// Free a nonce whose spend was refused after validation; the contract needs that nonce on retry.
+    pub async fn release(&self, key: &NonceKey) {
+        let mut nonces = self.nonces.write().await;
+        if nonces.remove(key).is_some() {
+            self.persist(&nonces);
+        }
+    }
+
     fn persist(&self, nonces: &HashMap<NonceKey, u64>) {
         let Some(ref path) = self.path else { return };
         let records: Vec<NonceRecord> = nonces

@@ -416,6 +416,12 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("\"excessive_preauth\""), "{body}");
     assert_eq!(chain.on_chain(&a).await, (FUNDED - 750, 2));
+    // A refusal after validation frees the nonce: the contract requires nonce 2 next.
+    let retry = PaymentProof::SpendAuth(chain.sign(&a, &a.key, 300, 2));
+    authorize_request(&gate, retry, 300, healthy())
+        .await
+        .map_err(|r| anyhow::anyhow!("retry after excessive_preauth refused: {}", r.status()))?;
+    assert_eq!(chain.on_chain(&a).await, (FUNDED - 1050, 3));
 
     // Floor: one unit under the estimate is a 402 quoting the floor, before authorizeSpend.
     let short = chain.sign(&b, &b.key, 299, 0);
@@ -428,6 +434,11 @@ async fn spend_auth_gate_floor_ceiling_rail_and_nonce_order_on_anvil() -> anyhow
     assert_eq!(status, 402, "{body}");
     assert!(body.contains("\"payment_required\""), "{body}");
     assert_eq!(chain.on_chain(&b).await, (FUNDED, 0));
+    let retry = chain.sign(&b, &b.key, 300, 0);
+    billing_gate(&gate, &none, Some(retry), 300)
+        .await
+        .map_err(|r| anyhow::anyhow!("retry after the floor refusal refused: {}", r.status()))?;
+    assert_eq!(chain.on_chain(&b).await, (FUNDED - 300, 1));
 
     // Ceiling never below the floor: min_charge 1000 > 1.5 x 100, so exactly 1000 is accepted.
     let floor_gate = chain.state(1000, shielded, token);
