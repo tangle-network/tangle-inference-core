@@ -17,6 +17,7 @@ sha2 = "0.10"
 blueprint-core = { git = "https://github.com/tangle-network/blueprint", rev = "74801e0e62a5918f63ef471efa8e975fa8c8e3b2", default-features = false }
 blueprint-tee = { version = "=0.2.0-alpha.11", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 anyhow = "1"
 

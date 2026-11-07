@@ -167,9 +167,25 @@ pub struct AppState {
     /// New blueprints should use this instead of `billing` directly.
     pub payment_provider: Arc<dyn PaymentProvider>,
     pub(crate) endpoint_authorization: Option<[u8; 32]>,
+    /// Settlements that outlive the request that started them.
+    settlements: tokio_util::task::TaskTracker,
 }
 
 impl AppState {
+    /// Settle served work after the response is sent; [`AppState::drain_settlements`] waits for it.
+    pub fn spawn_settlement(
+        &self,
+        settlement: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.settlements.spawn(settlement);
+    }
+
+    /// Stop taking settlements and wait for the pending ones, so work served before shutdown is paid.
+    pub async fn drain_settlements(&self) {
+        self.settlements.close();
+        self.settlements.wait().await;
+    }
+
     /// Downcast the backend extension to a concrete type.
     ///
     /// Returns `None` if the stored backend is not of type `B`.
@@ -360,6 +376,7 @@ impl AppStateBuilder {
             payment_provider,
             backend,
             endpoint_authorization,
+            settlements: tokio_util::task::TaskTracker::new(),
         })
     }
 }
