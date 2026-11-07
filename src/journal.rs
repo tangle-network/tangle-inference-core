@@ -1,8 +1,4 @@
 //! Crash-safe record of settlements owed for served work.
-//!
-//! An operator can be killed between serving a request and confirming its on-chain
-//! settlement. Each owed settlement is appended and fsynced before its first transaction,
-//! and removed once the chain confirms it, so a restart settles whatever was left owed.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -10,14 +6,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use alloy::primitives::Address;
 use serde::{Deserialize, Serialize};
 
 use crate::server::SpendAuthPayload;
 
-/// Settled records appended before the journal is rewritten to its owed entries.
 const COMPACT_AFTER: usize = 1024;
 
-/// One authorization's settlement: `amount` is settled when `metered`, else claimed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settlement {
     pub auth_hash: String,
@@ -36,7 +31,6 @@ enum Record {
 pub struct SettlementJournal {
     path: PathBuf,
     inner: Mutex<Inner>,
-    /// Held for the journal's life: a second writer would rename the file out from under this one.
     _lock: File,
 }
 
@@ -47,10 +41,9 @@ struct Inner {
 }
 
 impl SettlementJournal {
-    /// Load the owed settlements at `path` and rewrite the file to hold only them.
-    /// A torn final line from a crash mid-append is skipped. None when another client in
-    /// this or another process holds the journal, so this one settles unjournaled.
-    pub fn open(path: PathBuf) -> anyhow::Result<Option<Self>> {
+    /// Load this operator's owed settlements and rewrite the file to only those.
+    /// None when another client holds the journal. A torn last line is skipped.
+    pub fn open(path: PathBuf, operator: Address) -> anyhow::Result<Option<Self>> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
@@ -72,7 +65,16 @@ impl SettlementJournal {
         if let Ok(file) = File::open(&path) {
             for line in BufReader::new(file).lines() {
                 match serde_json::from_str(&line?) {
-                    Ok(Record::Owed(s)) => _ = owed.insert(s.auth_hash.clone(), s),
+                    Ok(Record::Owed(s))
+                        if s.spend_auth.operator.parse::<Address>().ok() == Some(operator) =>
+                    {
+                        _ = owed.insert(s.auth_hash.clone(), s);
+                    }
+                    Ok(Record::Owed(s)) => tracing::warn!(
+                        auth_hash = %s.auth_hash,
+                        operator = %s.spend_auth.operator,
+                        "dropping a journal line this operator will not settle"
+                    ),
                     Ok(Record::Settled(hash)) => _ = owed.remove(&hash),
                     Err(e) => tracing::warn!(error = %e, "skipping unreadable settlement record"),
                 }
@@ -134,7 +136,6 @@ fn append(file: &mut File, record: &Record, sync: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Atomically replace the journal with `owed` and return an append handle to it.
 fn rewrite<'a>(path: &Path, owed: impl Iterator<Item = &'a Settlement>) -> anyhow::Result<File> {
     let tmp = path.with_extension("tmp");
     let mut file = File::create(&tmp)?;
